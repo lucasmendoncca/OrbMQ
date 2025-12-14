@@ -85,7 +85,9 @@ Go 1.21 or newer
 An MQTT client (MQTT Explorer or mosquitto)
 
 ### Run the broker
-`go run ./cmd/broker`
+```sh
+go run .\cmd\orbmq\main.go
+``` 
 
 The broker listens on port 1883 by default.
 
