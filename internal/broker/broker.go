@@ -1,7 +1,7 @@
 package broker
 
 import (
-	"sync"
+	"sync/atomic"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/client"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
@@ -9,14 +9,13 @@ import (
 )
 
 type Broker struct {
-	topics *topic.Tree
-	mu     sync.RWMutex
+	topics atomic.Value
 }
 
 func New() *Broker {
-	return &Broker{
-		topics: topic.NewTree(),
-	}
+	b := &Broker{}
+	b.topics.Store(topic.NewTree())
+	return b
 }
 
 // Subscribe adds a client to the broker's subscription list.
@@ -27,18 +26,19 @@ func New() *Broker {
 // If a client is already subscribed to a topic, calling Subscribe again will not
 // cause the client to receive duplicate messages.
 func (b *Broker) Subscribe(filter string, c *client.Client) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	oldTree := b.topics.Load().(*topic.Tree)
 
-	b.topics.Subscribe(filter, c)
+	newTree := oldTree.Clone()
+	newTree.Subscribe(filter, c)
+
+	b.topics.Store(newTree)
 }
 
 // Publish sends a message to all clients subscribed to topics that match the
 // given PublishPacket's topic name.
 func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
-	b.mu.RLock()
-	subs := b.topics.Match(pub.Topic)
-	b.mu.RUnlock()
+	tree := b.topics.Load().(*topic.Tree)
+	subs := tree.Match(pub.Topic)
 
 	for _, sub := range subs {
 		if err := sub.Enqueue(raw); err != nil {

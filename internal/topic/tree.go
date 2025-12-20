@@ -47,6 +47,15 @@ func (t *Tree) Subscribe(filter string, sub Subscriber) {
 	cur.subs[sub.ID()] = sub
 }
 
+// Clone returns a deep copy of the tree. It is used by the
+// Broker's Clone function to create a copy of the tree.
+// The returned tree is a new, independent copy of the original tree.
+func (t *Tree) Clone() *Tree {
+    return &Tree{
+        root: t.root.clone(),
+    }
+}
+
 // Match returns a list of subscribers that are subscribed to the given topic.
 // The topic string can contain single-level or multi-level wildcards.
 // For example, "foo/bar", "foo/+", "foo/#".
@@ -57,6 +66,25 @@ func (t *Tree) Match(topic string) []Subscriber {
 	var result []Subscriber
 	t.match(t.root, levels, &result)
 	return result
+}
+
+// clone returns a deep copy of the node. It is used by the Tree's
+// Clone function to create a copy of the tree.
+func (n *node) clone() *node {
+    nn := &node{
+        children: make(map[string]*node, len(n.children)),
+        subs:     make(map[string]Subscriber, len(n.subs)),
+    }
+
+    for k, v := range n.children {
+        nn.children[k] = v.clone()
+    }
+
+    for id, sub := range n.subs {
+        nn.subs[id] = sub
+    }
+
+    return nn
 }
 
 // match is a helper function that returns a list of subscribers that are
