@@ -41,6 +41,8 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
 	b.mu.RUnlock()
 
 	for _, sub := range subs {
-		_ = sub.Send(raw) // QoS 0, fire-and-forget
+		if err := sub.Enqueue(raw); err != nil {
+			// TODO: metrics / disconnect slow client
+		}
 	}
 }

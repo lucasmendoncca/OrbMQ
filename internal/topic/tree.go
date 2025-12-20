@@ -11,7 +11,7 @@ type node struct {
 
 type Subscriber interface {
 	ID() string
-	Send([]byte) error
+	Enqueue([]byte) error
 }
 
 func NewTree() *Tree {

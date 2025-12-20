@@ -49,7 +49,6 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
 
 	// --- 1. CONNECT ---
 	pkt, err := protocol.Decode(conn)
@@ -65,6 +64,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	cli := client.New(connect.ClientID, conn)
+	defer cli.Close()
 
 	log.Printf("client connected: %s", cli.ID())
 
@@ -78,7 +78,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// --- 3. Loop pós-handshake ---
+	// --- 3. LOOP AFTER HANDSHAKE ---
 	for {
 		select {
 		case <-ctx.Done():
@@ -93,14 +93,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			switch p := pkt.(type) {
 
 			case *protocol.PingReqPacket:
-				// PINGRESP obrigatório
 				if err := protocol.Encode(conn, &protocol.PingRespPacket{}); err != nil {
 					log.Printf("pingresp error: %v", err)
 					return
 				}
 
 			case *protocol.SubscribePacket:
-				// Registrar subscriptions
 				for _, sub := range p.Subscriptions {
 					s.broker.Subscribe(sub.Topic, cli)
 				}
@@ -120,7 +118,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				}
 
 			case *protocol.PublishPacket:
-				// Re-encode PUBLISH para fan-out
 				var buf bytes.Buffer
 				if err := protocol.EncodePublish(&buf, p.Topic, p.Payload); err != nil {
 					log.Printf("publish encode error: %v", err)
