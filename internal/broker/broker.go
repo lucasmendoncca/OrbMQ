@@ -3,7 +3,6 @@ package broker
 import (
 	"sync/atomic"
 
-	"github.com/lucasmendoncca/OrbMQ/internal/client"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 )
@@ -25,11 +24,11 @@ func New() *Broker {
 // A client can subscribe to multiple topics by calling Subscribe multiple times.
 // If a client is already subscribed to a topic, calling Subscribe again will not
 // cause the client to receive duplicate messages.
-func (b *Broker) Subscribe(filter string, c *client.Client) {
+func (b *Broker) Subscribe(filter string, sub topic.Subscriber) {
 	oldTree := b.topics.Load().(*topic.Tree)
 
 	newTree := oldTree.Clone()
-	newTree.Subscribe(filter, c)
+	newTree.Subscribe(filter, sub)
 
 	b.topics.Store(newTree)
 }
@@ -45,4 +44,6 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
 			// TODO: metrics / disconnect slow client
 		}
 	}
+
+	topic.PutSubs(subs)
 }

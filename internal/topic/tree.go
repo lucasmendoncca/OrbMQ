@@ -51,9 +51,9 @@ func (t *Tree) Subscribe(filter string, sub Subscriber) {
 // Broker's Clone function to create a copy of the tree.
 // The returned tree is a new, independent copy of the original tree.
 func (t *Tree) Clone() *Tree {
-    return &Tree{
-        root: t.root.clone(),
-    }
+	return &Tree{
+		root: t.root.clone(),
+	}
 }
 
 // Match returns a list of subscribers that are subscribed to the given topic.
@@ -61,30 +61,37 @@ func (t *Tree) Clone() *Tree {
 // For example, "foo/bar", "foo/+", "foo/#".
 // If no subscribers match the given topic, an empty list is returned.
 func (t *Tree) Match(topic string) []Subscriber {
-	levels := split(topic)
+	subs := subsPool.Get().([]Subscriber)
+	subs = subs[:0]
 
-	var result []Subscriber
-	t.match(t.root, levels, &result)
-	return result
+	t.match(t.root, topic, 0, &subs)
+	return subs
+}
+
+func PutSubs(subs []Subscriber) {
+	if cap(subs) > 1024 {
+		return
+	}
+	subsPool.Put(subs[:0])
 }
 
 // clone returns a deep copy of the node. It is used by the Tree's
 // Clone function to create a copy of the tree.
 func (n *node) clone() *node {
-    nn := &node{
-        children: make(map[string]*node, len(n.children)),
-        subs:     make(map[string]Subscriber, len(n.subs)),
-    }
+	nn := &node{
+		children: make(map[string]*node, len(n.children)),
+		subs:     make(map[string]Subscriber, len(n.subs)),
+	}
 
-    for k, v := range n.children {
-        nn.children[k] = v.clone()
-    }
+	for k, v := range n.children {
+		nn.children[k] = v.clone()
+	}
 
-    for id, sub := range n.subs {
-        nn.subs[id] = sub
-    }
+	for id, sub := range n.subs {
+		nn.subs[id] = sub
+	}
 
-    return nn
+	return nn
 }
 
 // match is a helper function that returns a list of subscribers that are
@@ -93,12 +100,12 @@ func (n *node) clone() *node {
 //
 // The function takes a node, a slice of strings representing the topic
 // levels, and a slice of Subscribers to store the matching subscribers.
-func (t *Tree) match(n *node, levels []string, out *[]Subscriber) {
+func (t *Tree) match(n *node, topic string, idx int, out *[]Subscriber) {
 	if n == nil {
 		return
 	}
 
-	if len(levels) == 0 {
+	if idx >= len(topic) {
 		for _, sub := range n.subs {
 			*out = append(*out, sub)
 		}
@@ -110,15 +117,27 @@ func (t *Tree) match(n *node, levels []string, out *[]Subscriber) {
 		return
 	}
 
-	lvl := levels[0]
+	next := idx
+	for next < len(topic) && topic[next] != '/' {
+		next++
+	}
 
-	// Exact match
-	t.match(n.children[lvl], levels[1:], out)
+	level := topic[idx:next]
 
-	// Single-level wildcard
-	t.match(n.children["+"], levels[1:], out)
+	var nextIdx int
+	if next < len(topic) && topic[next] == '/' {
+		nextIdx = next + 1
+	} else {
+		nextIdx = next
+	}
 
-	// Multi-level wildcard
+	// exact match
+	t.match(n.children[level], topic, nextIdx, out)
+
+	// '+'
+	t.match(n.children["+"], topic, nextIdx, out)
+
+	// '#'
 	if hash := n.children["#"]; hash != nil {
 		for _, sub := range hash.subs {
 			*out = append(*out, sub)
