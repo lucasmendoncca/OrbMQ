@@ -64,7 +64,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	cli := client.New(connect.ClientID, conn)
-	defer cli.Close()
+	defer func() {
+		s.broker.UnsubscribeAll(cli.ID())
+		cli.Close()
+	}()
 
 	log.Printf("client connected: %s", cli.ID())
 
@@ -125,6 +128,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				}
 
 				s.broker.Publish(p, buf.Bytes())
+
+			case *protocol.DisconnectPacket:
+				log.Printf("client %s sent DISCONNECT", cli.ID())
+				return
 
 			default:
 				log.Printf("unsupported packet type")

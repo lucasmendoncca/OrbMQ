@@ -60,6 +60,12 @@ func Decode(r io.Reader) (Packet, error) {
 		}
 		return decodePublish(br, remainingLength)
 
+	case PacketTypeDisconnect:
+		if flags != 0 || remainingLength != 0 {
+			return nil, errors.New("invalid DISCONNECT packet")
+		}
+		return &DisconnectPacket{}, nil
+
 	default:
 		return nil, errors.New("unsupported packet type")
 	}

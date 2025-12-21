@@ -68,11 +68,23 @@ func (t *Tree) Match(topic string) []Subscriber {
 	return subs
 }
 
+// PutSubs returns a slice of Subscribers to the subsPool, to be reused
+// by the Match function. It is used to avoid unnecessary memory allocations
+// when the Match function is called with a large number of subscribers.
+// If the capacity of the slice is greater than 1024, the slice is not returned to
+// the pool, as it is unlikely to be reused.
 func PutSubs(subs []Subscriber) {
 	if cap(subs) > 1024 {
 		return
 	}
 	subsPool.Put(subs[:0])
+}
+
+// UnsubscribeAll removes all subscriptions for the given clientID from the tree.
+// It is used by the Broker's UnsubscribeAll function to remove all subscriptions
+// for a client when the client disconnects.
+func (t *Tree) UnsubscribeAll(clientID string) {
+	t.unsubscribeAll(t.root, clientID)
 }
 
 // clone returns a deep copy of the node. It is used by the Tree's
@@ -142,6 +154,21 @@ func (t *Tree) match(n *node, topic string, idx int, out *[]Subscriber) {
 		for _, sub := range hash.subs {
 			*out = append(*out, sub)
 		}
+	}
+}
+
+// unsubscribeAll removes all subscriptions for the given clientID from the tree.
+// It is used by the Broker's UnsubscribeAll function to remove all subscriptions
+// for a client when the client disconnects.
+func (t *Tree) unsubscribeAll(n *node, clientID string) {
+	if n == nil {
+		return
+	}
+
+	delete(n.subs, clientID)
+
+	for _, child := range n.children {
+		t.unsubscribeAll(child, clientID)
 	}
 }
 
