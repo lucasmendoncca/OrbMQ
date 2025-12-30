@@ -1,5 +1,12 @@
 package topic
 
+// MatchFilter takes a filter string and a topic string and returns true if the
+// topic matches the filter, and false otherwise. The filter string can contain
+// single-level or multi-level wildcards. For example, the filter string "foo/bar"
+// matches the topic string "foo/bar", and the filter string "foo/+" matches the
+// topic strings "foo/bar", "foo/baz", etc. The filter string "foo/#" matches
+// the topic strings "foo/bar/baz", "foo/bar/foo", etc. If the filter string
+// does not contain any wildcards, it must match the topic string exactly.
 func MatchFilter(filter, topic string) bool {
 	fLevels := splitFilter(filter)
 	tLevels := splitTopic(topic)
