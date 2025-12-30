@@ -12,15 +12,21 @@ The project follows the MQTT 3.1.1 specification and currently implements a func
 
 - CONNECT / CONNACK handshake
 
+- DISCONNECT handling with proper subscription cleanup
+
 - PINGREQ / PINGRESP keepalive handling
 
 - SUBSCRIBE / SUBACK support
 
 - PUBLISH (QoS 0)
 
+- Retained messages support
+
 - Topic routing with + and # wildcards
 
 - Concurrent fan-out to multiple subscribers
+
+- Lock-free publish hot path using copy-on-write state
 
 - Protocol parsing with strict Remaining Length handling
 
@@ -50,6 +56,10 @@ OrbMQ is structured to clearly separate responsibilities:
 
   - Fan-out logic
 
+  - Retained message management
+
+  - Retained message management
+
 - topic
 
   - Topic tree (trie)
@@ -60,22 +70,23 @@ OrbMQ is structured to clearly separate responsibilities:
 
   - Connection abstraction
 
-  - Thread-safe writes to the network socket
- 
+  - Buffered, thread-safe writes to the network socket
 
+  - Backpressure handling
+ 
 ## Supported MQTT Packets
 
-| Packet      | Supported | Notes                 |
-| ----------- | --------- | --------------------- |
-| CONNECT     | Yes       | MQTT 3.1.1 only       |
-| CONNACK     | Yes       | Session Present false |
-| PINGREQ     | Yes       |                       |
-| PINGRESP    | Yes       |                       |
-| SUBSCRIBE   | Yes       | QoS 0 only            |
-| SUBACK      | Yes       |                       |
-| PUBLISH     | Yes       | QoS 0 only            |
-| UNSUBSCRIBE | No        | Planned               |
-| DISCONNECT  | No        | Planned               |
+| Packet      | Supported | Notes                           |
+| ----------- | --------- | --------------------------------|
+| CONNECT     | Yes       | MQTT 3.1.1 only                 |
+| CONNACK     | Yes       | Session Present false           |
+| PINGREQ     | Yes       |                                 |
+| PINGRESP    | Yes       |                                 |
+| SUBSCRIBE   | Yes       | QoS 0 only                      |
+| SUBACK      | Yes       |                                 |
+| PUBLISH     | Yes       | QoS 0 only                      |
+| DISCONNECT  | Yes       | Graceful disconnect and cleanup |
+| UNSUBSCRIBE | No        | Planned                         |
 
 ## Getting Started
 ### Requirements
@@ -107,9 +118,7 @@ The broker listens on port 1883 by default.
 
 Planned next steps:
 
-- DISCONNECT handling and subscription cleanup
-
-- Retained messages
+- UNSUBSCRIBE support
 
 - Session management and Clean Session support
 
@@ -117,11 +126,13 @@ Planned next steps:
 
 - Metrics and observability
 
+- Docker image and containerized deployment
+
 - TLS and authentication
 
 - QoS 1 support
 
 ## License
 
-This project is currently provided for experimental purposes.
-A formal license will be added in a future revision.
+OrbMQ is licensed under the MIT License.
+See the LICENSE file for details.
