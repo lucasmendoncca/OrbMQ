@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"bytes"
+	"maps"
 	"sync/atomic"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
@@ -8,12 +10,19 @@ import (
 )
 
 type Broker struct {
-	topics atomic.Value
+	topics   atomic.Value
+	retained atomic.Value
+}
+
+type retainedMessage struct {
+	Topic   string
+	Payload []byte
 }
 
 func New() *Broker {
 	b := &Broker{}
 	b.topics.Store(topic.NewTree())
+	b.retained.Store(make(map[string]*retainedMessage))
 	return b
 }
 
@@ -36,6 +45,10 @@ func (b *Broker) Subscribe(filter string, sub topic.Subscriber) {
 // Publish sends a message to all clients subscribed to topics that match the
 // given PublishPacket's topic name.
 func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
+	if pub.Retain {
+		b.updateRetained(pub)
+	}
+
 	tree := b.topics.Load().(*topic.Tree)
 	subs := tree.Match(pub.Topic)
 
@@ -58,4 +71,44 @@ func (b *Broker) UnsubscribeAll(clientID string) {
 	newTree.UnsubscribeAll(clientID)
 
 	b.topics.Store(newTree)
+}
+
+// SendRetained sends all retained messages matching the given filter to the
+// given Subscriber. This is used by the Broker to send retained messages
+// to clients when they subscribe to a topic.
+func (b *Broker) SendRetained(filter string, sub topic.Subscriber) {
+	retained := b.retained.Load().(map[string]*retainedMessage)
+
+	for t, msg := range retained {
+		if topic.MatchFilter(filter, t) {
+			var buf bytes.Buffer
+			_ = protocol.EncodePublish(&buf, msg.Topic, msg.Payload, true)
+			_ = sub.Enqueue(buf.Bytes())
+		}
+	}
+}
+
+// updateRetained updates the broker's retained messages map with the given
+// publish packet. If the packet's payload is empty, it removes the
+// retained message for the given topic. Otherwise, it adds the
+// retained message for the given topic if it doesn't already exist.
+// If the retained message already exists, it will be overwritten with the
+// new message.
+func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
+	oldMap := b.retained.Load().(map[string]*retainedMessage)
+
+	newMap := make(map[string]*retainedMessage, len(oldMap))
+	maps.Copy(newMap, oldMap)
+
+	if len(pub.Payload) == 0 {
+		// remove retained
+		delete(newMap, pub.Topic)
+	} else {
+		newMap[pub.Topic] = &retainedMessage{
+			Topic:   pub.Topic,
+			Payload: pub.Payload,
+		}
+	}
+
+	b.retained.Store(newMap)
 }

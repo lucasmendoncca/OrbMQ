@@ -77,6 +77,7 @@ func (d *DisconnectPacket) Type() PacketType {
 type PublishPacket struct {
 	Topic   string
 	Payload []byte
+	Retain  bool
 }
 
 func (p *PublishPacket) Type() PacketType {

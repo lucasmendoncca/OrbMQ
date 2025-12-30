@@ -104,6 +104,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			case *protocol.SubscribePacket:
 				for _, sub := range p.Subscriptions {
 					s.broker.Subscribe(sub.Topic, cli)
+
+					s.broker.SendRetained(sub.Topic, cli)
 				}
 
 				// SUBACK
@@ -122,7 +124,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 			case *protocol.PublishPacket:
 				var buf bytes.Buffer
-				if err := protocol.EncodePublish(&buf, p.Topic, p.Payload); err != nil {
+				if err := protocol.EncodePublish(&buf, p.Topic, p.Payload, p.Retain); err != nil {
 					log.Printf("publish encode error: %v", err)
 					return
 				}

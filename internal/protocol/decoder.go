@@ -58,7 +58,10 @@ func Decode(r io.Reader) (Packet, error) {
 		if qos != 0 {
 			return nil, errors.New("only QoS 0 supported")
 		}
-		return decodePublish(br, remainingLength)
+
+		retain := flags&0x01 != 0
+
+		return decodePublish(br, remainingLength, retain)
 
 	case PacketTypeDisconnect:
 		if flags != 0 || remainingLength != 0 {
@@ -201,7 +204,7 @@ func decodeSubscribe(r io.Reader, remainingLength int) (*SubscribePacket, error)
 // If the packet is malformed, an error will be returned.
 // If the packet is valid, a *PublishPacket will be returned with its fields populated.
 // The *PublishPacket will contain the topic name and payload.
-func decodePublish(r io.Reader, remainingLength int) (*PublishPacket, error) {
+func decodePublish(r io.Reader, remainingLength int, retain bool) (*PublishPacket, error) {
 	lr := &io.LimitedReader{
 		R: r,
 		N: int64(remainingLength),
@@ -212,11 +215,6 @@ func decodePublish(r io.Reader, remainingLength int) (*PublishPacket, error) {
 		return nil, err
 	}
 
-	if topic == "" {
-		return nil, errors.New("empty topic name")
-	}
-
-	// Remaining bytes = payload
 	payload := make([]byte, lr.N)
 	if _, err := io.ReadFull(lr, payload); err != nil {
 		return nil, err
@@ -225,6 +223,7 @@ func decodePublish(r io.Reader, remainingLength int) (*PublishPacket, error) {
 	return &PublishPacket{
 		Topic:   topic,
 		Payload: payload,
+		Retain:  retain,
 	}, nil
 }
 

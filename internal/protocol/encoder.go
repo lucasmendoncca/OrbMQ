@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -32,12 +33,17 @@ func Encode(w io.Writer, p Packet) error {
 //
 // The function is intended for use by the OrbMQ server only.
 // It is not intended for use by clients.
-func EncodePublish(w io.Writer, topic string, payload []byte) error {
+func EncodePublish(w io.Writer, topic string, payload []byte, retain bool) error {
 	remainingLength := 2 + len(topic) + len(payload)
 
 	// Fixed header
+	flags := byte(0x30) // PUBLISH, QoS 0
+	if retain {
+		flags |= 0x01 // RETAIN
+	}
+
 	if _, err := w.Write([]byte{
-		0x30,
+		flags,
 		byte(remainingLength),
 	}); err != nil {
 		return err
@@ -54,6 +60,13 @@ func EncodePublish(w io.Writer, topic string, payload []byte) error {
 	// Payload
 	_, err := w.Write(payload)
 	return err
+}
+
+func EncodeRetained(topic string, payload []byte) []byte {
+	var buf bytes.Buffer
+
+	_ = EncodePublish(&buf, topic, payload, true)
+	return buf.Bytes()
 }
 
 // EncodeConnAck writes a CONNACK packet to the given io.Writer. The
