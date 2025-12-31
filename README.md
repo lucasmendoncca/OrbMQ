@@ -58,8 +58,6 @@ OrbMQ is structured to clearly separate responsibilities:
 
   - Retained message management
 
-  - Retained message management
-
 - topic
 
   - Topic tree (trie)
