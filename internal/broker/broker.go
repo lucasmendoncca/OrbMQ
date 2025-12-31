@@ -2,9 +2,11 @@ package broker
 
 import (
 	"bytes"
+	"errors"
 	"maps"
 	"sync/atomic"
 
+	"github.com/lucasmendoncca/OrbMQ/internal/client"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 )
@@ -54,7 +56,9 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
 
 	for _, sub := range subs {
 		if err := sub.Enqueue(raw); err != nil {
-			// TODO: metrics / disconnect slow client
+			if errors.Is(err, client.ErrClientQueueFull) {
+				b.evictSlowClient(sub)
+			}
 		}
 	}
 
@@ -111,4 +115,21 @@ func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
 	}
 
 	b.retained.Store(newMap)
+}
+
+// evictSlowClient is a defensive measure to handle slow clients that
+// cannot keep up with the rate of incoming messages. It removes all
+// subscriptions for the given clientID and closes the client. This is
+// used by the Broker's Publish function to evict slow clients when the
+// client's queue is full and the client cannot keep up with the rate of
+// incoming messages.
+func (b *Broker) evictSlowClient(sub topic.Subscriber) {
+	// avoid double-eviction
+	id := sub.ID()
+
+	b.UnsubscribeAll(id)
+
+	if c, ok := sub.(interface{ Close() }); ok {
+		c.Close()
+	}
 }
