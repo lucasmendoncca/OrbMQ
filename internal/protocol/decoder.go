@@ -7,6 +7,15 @@ import (
 	"io"
 )
 
+type connectFlags struct {
+	cleanSession bool
+	willFlag     bool
+	willQoS      byte
+	willRetain   bool
+	usernameFlag bool
+	passwordFlag bool
+}
+
 // Decode reads a packet from the given io.Reader and returns the corresponding
 // decoded Packet, or an error if the packet is invalid.
 //
@@ -80,17 +89,49 @@ func Decode(r io.Reader) (Packet, error) {
 	}
 }
 
-// Decode a CONNECT packet from the given io.Reader and returns the decoded
-// ConnectPacket, or an error if the packet is invalid.
-//
-// If the packet type is not supported, the function returns an error.
-func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
-	lr := &io.LimitedReader{
-		R: r,
-		N: int64(remainingLength),
+func decodeConnectFlags(b byte) (connectFlags, error) {
+	if b&0x01 != 0 {
+		return connectFlags{}, errors.New("reserved connect flag must be 0")
 	}
 
-	// Protocol Name
+	f := connectFlags{
+		cleanSession: b&0x02 != 0,
+		willFlag:     b&0x04 != 0,
+		willQoS:      (b >> 3) & 0x03,
+		willRetain:   b&0x20 != 0,
+		usernameFlag: b&0x80 != 0,
+		passwordFlag: b&0x40 != 0,
+	}
+
+	if !f.willFlag && (f.willQoS != 0 || f.willRetain) {
+		return connectFlags{}, errors.New("will QoS and retain must be 0 when will flag is not set")
+	}
+
+	if f.passwordFlag && !f.usernameFlag {
+		return connectFlags{}, errors.New("password flag requires username flag")
+	}
+
+	return f, nil
+}
+
+func decodeWill(r io.Reader, qos byte, retain bool) (*WillMessage, error) {
+	topic, err := readUTF8String(r)
+	if err != nil {
+		return nil, err
+	}
+
+	payload, err := readBinaryData(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return &WillMessage{Topic: topic, Payload: payload, QoS: qos, Retain: retain}, nil
+}
+
+func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
+	lr := &io.LimitedReader{R: r, N: int64(remainingLength)}
+
+	// Variable header
 	protoName, err := readUTF8String(lr)
 	if err != nil {
 		return nil, err
@@ -99,7 +140,6 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 		return nil, errors.New("invalid protocol name")
 	}
 
-	// Protocol Level
 	var level [1]byte
 	if _, err := io.ReadFull(lr, level[:]); err != nil {
 		return nil, err
@@ -108,19 +148,15 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 		return nil, errors.New("unsupported protocol level")
 	}
 
-	// Connect Flags
-	var flags [1]byte
-	if _, err := io.ReadFull(lr, flags[:]); err != nil {
+	var flagsByte [1]byte
+	if _, err := io.ReadFull(lr, flagsByte[:]); err != nil {
+		return nil, err
+	}
+	flags, err := decodeConnectFlags(flagsByte[0])
+	if err != nil {
 		return nil, err
 	}
 
-	if flags[0]&0x01 != 0 {
-		return nil, errors.New("reserved connect flag must be 0")
-	}
-
-	cleanSession := flags[0]&0x02 != 0
-
-	// Keep Alive
 	var keepAlive uint16
 	if err := binary.Read(lr, binary.BigEndian, &keepAlive); err != nil {
 		return nil, err
@@ -131,9 +167,34 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	if clientID == "" && !cleanSession {
+	if clientID == "" && !flags.cleanSession {
 		return nil, errors.New("clientID must be present if clean session is false")
+	}
+
+	var will *WillMessage
+	if flags.willFlag {
+		will, err = decodeWill(lr, flags.willQoS, flags.willRetain)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var username *string
+	if flags.usernameFlag {
+		u, err := readUTF8String(lr)
+		if err != nil {
+			return nil, err
+		}
+		username = &u
+	}
+
+	var password *string
+	if flags.passwordFlag {
+		p, err := readUTF8String(lr)
+		if err != nil {
+			return nil, err
+		}
+		password = &p
 	}
 
 	if lr.N != 0 {
@@ -143,9 +204,12 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 	return &ConnectPacket{
 		ProtocolName:  protoName,
 		ProtocolLevel: level[0],
-		CleanSession:  cleanSession,
+		CleanSession:  flags.cleanSession,
 		KeepAlive:     keepAlive,
 		ClientID:      clientID,
+		Will:          will,
+		Username:      username,
+		Password:      password,
 	}, nil
 }
 

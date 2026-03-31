@@ -19,6 +19,15 @@ type Packet interface {
 	Type() PacketType
 }
 
+// WillMessage is the Last Will and Testament declared in a CONNECT packet.
+// The broker publishes it when the client disconnects without sending DISCONNECT.
+type WillMessage struct {
+	Topic   string
+	Payload []byte
+	QoS     byte
+	Retain  bool
+}
+
 // ConnectPacket represents a CONNECT packet sent by a client to the server.
 // It contains information about the client such as its protocol version,
 // whether it wants to clean its session, and how often it wants to send
@@ -34,6 +43,7 @@ type ConnectPacket struct {
 
 	ClientID string
 
+	Will     *WillMessage
 	Username *string
 	Password *string
 }

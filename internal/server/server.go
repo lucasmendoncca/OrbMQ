@@ -76,7 +76,14 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	s.serve(ctx, conn, cli, activeFilters, connect.KeepAlive)
+	cleanDisconnect := false
+	defer func() {
+		if connect.Will != nil && !cleanDisconnect {
+			s.publishWill(connect.Will)
+		}
+	}()
+
+	cleanDisconnect = s.serve(ctx, conn, cli, activeFilters, connect.KeepAlive)
 }
 
 // handshake reads the first packet from conn, validates it is a CONNECT,
@@ -136,7 +143,9 @@ func (s *Server) closeSession(connect *protocol.ConnectPacket, cli *client.Clien
 }
 
 // serve runs the main packet loop for an established connection.
-func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, activeFilters map[string]struct{}, keepAlive uint16) {
+// serve runs the main packet loop. Returns true if the client disconnected
+// cleanly (sent DISCONNECT), false on error or timeout.
+func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, activeFilters map[string]struct{}, keepAlive uint16) bool {
 	var timeout time.Duration
 	if keepAlive > 0 {
 		timeout = time.Duration(float64(keepAlive)*1.5) * time.Second
@@ -145,7 +154,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, a
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 			if timeout > 0 {
 				conn.SetReadDeadline(time.Now().Add(timeout))
@@ -158,14 +167,14 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, a
 				} else {
 					log.Printf("decode error: %v", err)
 				}
-				return
+				return false
 			}
 
 			if err := s.handlePacket(conn, cli, pkt, activeFilters); err != nil {
 				if !errors.Is(err, errDisconnect) {
 					log.Printf("packet error: %v", err)
 				}
-				return
+				return errors.Is(err, errDisconnect)
 			}
 		}
 	}
@@ -190,6 +199,16 @@ func (s *Server) handlePacket(conn net.Conn, cli *client.Client, pkt protocol.Pa
 	default:
 		return errors.New("unsupported packet type")
 	}
+}
+
+func (s *Server) publishWill(will *protocol.WillMessage) {
+	var buf bytes.Buffer
+	_ = protocol.EncodePublish(&buf, will.Topic, will.Payload, will.Retain)
+	s.broker.Publish(&protocol.PublishPacket{
+		Topic:   will.Topic,
+		Payload: will.Payload,
+		Retain:  will.Retain,
+	}, buf.Bytes())
 }
 
 func (s *Server) handlePing(conn net.Conn) error {
