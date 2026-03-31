@@ -80,6 +80,22 @@ func PutSubs(subs []Subscriber) {
 	subsPool.Put(subs[:0])
 }
 
+// Unsubscribe removes the subscriber with the given clientID from the node
+// matching the specific filter. Other subscriptions for the same client are left intact.
+func (t *Tree) Unsubscribe(filter string, clientID string) {
+	levels := splitFilter(filter)
+
+	cur := t.root
+	for _, lvl := range levels {
+		if cur.children[lvl] == nil {
+			return
+		}
+		cur = cur.children[lvl]
+	}
+
+	delete(cur.subs, clientID)
+}
+
 // UnsubscribeAll removes all subscriptions for the given clientID from the tree.
 // It is used by the Broker's UnsubscribeAll function to remove all subscriptions
 // for a client when the client disconnects.

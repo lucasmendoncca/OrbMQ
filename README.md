@@ -84,7 +84,7 @@ OrbMQ is structured to clearly separate responsibilities:
 | SUBACK      | Yes       |                                 |
 | PUBLISH     | Yes       | QoS 0 only                      |
 | DISCONNECT  | Yes       | Graceful disconnect and cleanup |
-| UNSUBSCRIBE | No        | Planned                         |
+| UNSUBSCRIBE | YES       |                                 |
 
 ## Getting Started
 ### Requirements
@@ -115,8 +115,6 @@ The broker listens on port 1883 by default.
 ## Roadmap
 
 Planned next steps:
-
-- UNSUBSCRIBE support
 
 - Session management and Clean Session support
 

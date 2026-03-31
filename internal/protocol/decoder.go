@@ -63,6 +63,12 @@ func Decode(r io.Reader) (Packet, error) {
 
 		return decodePublish(br, remainingLength, retain)
 
+	case PacketTypeUnsubscribe:
+		if flags != 0x02 {
+			return nil, errors.New("invalid UNSUBSCRIBE flags")
+		}
+		return decodeUnsubscribe(br, remainingLength)
+
 	case PacketTypeDisconnect:
 		if flags != 0 || remainingLength != 0 {
 			return nil, errors.New("invalid DISCONNECT packet")
@@ -224,6 +230,42 @@ func decodePublish(r io.Reader, remainingLength int, retain bool) (*PublishPacke
 		Topic:   topic,
 		Payload: payload,
 		Retain:  retain,
+	}, nil
+}
+
+// decodeUnsubscribe reads an UNSUBSCRIBE packet from the given io.Reader.
+func decodeUnsubscribe(r io.Reader, remainingLength int) (*UnsubscribePacket, error) {
+	lr := &io.LimitedReader{
+		R: r,
+		N: int64(remainingLength),
+	}
+
+	var packetID uint16
+	if err := binary.Read(lr, binary.BigEndian, &packetID); err != nil {
+		return nil, err
+	}
+
+	if packetID == 0 {
+		return nil, errors.New("invalid packet identifier")
+	}
+
+	var topics []string
+
+	for lr.N > 0 {
+		topic, err := readUTF8String(lr)
+		if err != nil {
+			return nil, err
+		}
+		topics = append(topics, topic)
+	}
+
+	if len(topics) == 0 {
+		return nil, errors.New("unsubscribe must contain at least one topic")
+	}
+
+	return &UnsubscribePacket{
+		PacketID: packetID,
+		Topics:   topics,
 	}, nil
 }
 

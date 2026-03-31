@@ -19,6 +19,8 @@ func Encode(w io.Writer, p Packet) error {
 		return encodePingResp(w)
 	case *SubAckPacket:
 		return encodeSubAck(w, pkt)
+	case *UnsubAckPacket:
+		return encodeUnsubAck(w, pkt)
 	default:
 		return ErrUnsupportedPacket
 	}
@@ -101,6 +103,14 @@ func encodeConnAck(w io.Writer, pkt *ConnAckPacket) error {
 func encodePingResp(w io.Writer) error {
 	_, err := w.Write([]byte{0xD0, 0x00})
 	return err
+}
+
+// encodeUnsubAck writes an UNSUBACK packet to the given io.Writer.
+func encodeUnsubAck(w io.Writer, pkt *UnsubAckPacket) error {
+	if _, err := w.Write([]byte{0xB0, 0x02}); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, pkt.PacketID)
 }
 
 // EncodeSubAck writes a SUBACK packet to the given io.Writer. The

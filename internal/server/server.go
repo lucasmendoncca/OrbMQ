@@ -122,6 +122,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 					return
 				}
 
+			case *protocol.UnsubscribePacket:
+				for _, filter := range p.Topics {
+					s.broker.Unsubscribe(filter, cli.ID())
+				}
+
+				if err := protocol.Encode(conn, &protocol.UnsubAckPacket{
+					PacketID: p.PacketID,
+				}); err != nil {
+					log.Printf("unsuback error: %v", err)
+					return
+				}
+
 			case *protocol.PublishPacket:
 				var buf bytes.Buffer
 				if err := protocol.EncodePublish(&buf, p.Topic, p.Payload, p.Retain); err != nil {

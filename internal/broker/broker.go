@@ -65,6 +65,16 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, raw []byte) {
 	topic.PutSubs(subs)
 }
 
+// Unsubscribe removes the client's subscription for the given filter only.
+func (b *Broker) Unsubscribe(filter string, clientID string) {
+	oldTree := b.topics.Load().(*topic.Tree)
+
+	newTree := oldTree.Clone()
+	newTree.Unsubscribe(filter, clientID)
+
+	b.topics.Store(newTree)
+}
+
 // UnsubscribeAll removes all subscriptions for the given clientID from the broker.
 // It is used by the Broker's UnsubscribeAll function to remove all subscriptions
 // for a client when the client disconnects.

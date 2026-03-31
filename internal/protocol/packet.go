@@ -3,14 +3,16 @@ package protocol
 type PacketType byte
 
 const (
-	PacketTypeConnect    PacketType = 1
-	PacketTypeConnAck    PacketType = 2
-	PacketTypePublish    PacketType = 3
-	PacketTypeSubscribe  PacketType = 8
-	PacketTypeSubAck     PacketType = 9
-	PacketTypePingReq    PacketType = 12
-	PacketTypePingResp   PacketType = 13
-	PacketTypeDisconnect PacketType = 14
+	PacketTypeConnect     PacketType = 1
+	PacketTypeConnAck     PacketType = 2
+	PacketTypePublish     PacketType = 3
+	PacketTypeSubscribe   PacketType = 8
+	PacketTypeSubAck      PacketType = 9
+	PacketTypeUnsubscribe PacketType = 10
+	PacketTypeUnsubAck    PacketType = 11
+	PacketTypePingReq     PacketType = 12
+	PacketTypePingResp    PacketType = 13
+	PacketTypeDisconnect  PacketType = 14
 )
 
 type Packet interface {
@@ -115,6 +117,27 @@ type SubAckPacket struct {
 
 func (s *SubAckPacket) Type() PacketType {
 	return PacketTypeSubAck
+}
+
+// UnsubscribePacket represents an UNSUBSCRIBE packet sent by a client to the server.
+// It contains a packet identifier and a slice of topic filters to unsubscribe from.
+type UnsubscribePacket struct {
+	PacketID uint16
+	Topics   []string
+}
+
+func (u *UnsubscribePacket) Type() PacketType {
+	return PacketTypeUnsubscribe
+}
+
+// UnsubAckPacket is an UNSUBACK packet sent from the server to the client
+// in response to an UNSUBSCRIBE packet. It contains only the packet identifier.
+type UnsubAckPacket struct {
+	PacketID uint16
+}
+
+func (u *UnsubAckPacket) Type() PacketType {
+	return PacketTypeUnsubAck
 }
 
 // PingReqPacket is a PINGREQ packet sent from the client to the server
