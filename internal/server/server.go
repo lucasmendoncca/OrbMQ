@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"time"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
 	"github.com/lucasmendoncca/OrbMQ/internal/client"
@@ -75,7 +76,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	s.serve(ctx, conn, cli, activeFilters)
+	s.serve(ctx, conn, cli, activeFilters, connect.KeepAlive)
 }
 
 // handshake reads the first packet from conn, validates it is a CONNECT,
@@ -135,15 +136,28 @@ func (s *Server) closeSession(connect *protocol.ConnectPacket, cli *client.Clien
 }
 
 // serve runs the main packet loop for an established connection.
-func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, activeFilters map[string]struct{}) {
+func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, activeFilters map[string]struct{}, keepAlive uint16) {
+	var timeout time.Duration
+	if keepAlive > 0 {
+		timeout = time.Duration(float64(keepAlive)*1.5) * time.Second
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			if timeout > 0 {
+				conn.SetReadDeadline(time.Now().Add(timeout))
+			}
+
 			pkt, err := protocol.Decode(conn)
 			if err != nil {
-				log.Printf("decode error: %v", err)
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Printf("client %s keep-alive timeout", cli.ID())
+				} else {
+					log.Printf("decode error: %v", err)
+				}
 				return
 			}
 
