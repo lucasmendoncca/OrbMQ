@@ -9,6 +9,7 @@ import (
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
 	"github.com/lucasmendoncca/OrbMQ/internal/server"
+	"github.com/lucasmendoncca/OrbMQ/internal/session"
 )
 
 func main() {
@@ -20,7 +21,8 @@ func main() {
 	defer stop()
 
 	broker := broker.New()
-	srv := server.New(":1883", broker)
+	sessions := session.New()
+	srv := server.New(":1883", broker, sessions)
 
 	go func() {
 		if err := srv.Start(ctx); err != nil {
