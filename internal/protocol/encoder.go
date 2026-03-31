@@ -9,6 +9,24 @@ import (
 
 var ErrUnsupportedPacket = errors.New("unsupported packet type")
 
+// encodeRemainingLength writes the MQTT variable-length remaining length field.
+// It encodes values from 0 up to 268,435,455 using 1–4 bytes.
+func encodeRemainingLength(w io.Writer, length int) error {
+	for {
+		encodedByte := length % 128
+		length /= 128
+		if length > 0 {
+			encodedByte |= 0x80
+		}
+		if _, err := w.Write([]byte{byte(encodedByte)}); err != nil {
+			return err
+		}
+		if length == 0 {
+			return nil
+		}
+	}
+}
+
 // Encode writes a packet to the given io.Writer. It returns an error
 // if the packet type is not supported.
 func Encode(w io.Writer, p Packet) error {
@@ -44,10 +62,10 @@ func EncodePublish(w io.Writer, topic string, payload []byte, retain bool) error
 		flags |= 0x01 // RETAIN
 	}
 
-	if _, err := w.Write([]byte{
-		flags,
-		byte(remainingLength),
-	}); err != nil {
+	if _, err := w.Write([]byte{flags}); err != nil {
+		return err
+	}
+	if err := encodeRemainingLength(w, remainingLength); err != nil {
 		return err
 	}
 
@@ -124,10 +142,10 @@ func encodeSubAck(w io.Writer, pkt *SubAckPacket) error {
 	remainingLength := 2 + len(pkt.ReturnCodes)
 
 	// Fixed header
-	if _, err := w.Write([]byte{
-		0x90, // SUBACK
-		byte(remainingLength),
-	}); err != nil {
+	if _, err := w.Write([]byte{0x90}); err != nil {
+		return err
+	}
+	if err := encodeRemainingLength(w, remainingLength); err != nil {
 		return err
 	}
 
