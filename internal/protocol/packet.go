@@ -6,6 +6,7 @@ const (
 	PacketTypeConnect     PacketType = 1
 	PacketTypeConnAck     PacketType = 2
 	PacketTypePublish     PacketType = 3
+	PacketTypePubAck      PacketType = 4
 	PacketTypeSubscribe   PacketType = 8
 	PacketTypeSubAck      PacketType = 9
 	PacketTypeUnsubscribe PacketType = 10
@@ -81,19 +82,27 @@ func (d *DisconnectPacket) Type() PacketType {
 	return PacketTypeDisconnect
 }
 
-// PublishPacket is a PUBLISH packet sent from the client to the server
-// and is used to send a message to all clients subscribed to topics that
-// match the packet's topic name.
-//
-// It contains the topic name and the message payload.
+// PublishPacket is a PUBLISH packet sent between client and broker.
 type PublishPacket struct {
-	Topic   string
-	Payload []byte
-	Retain  bool
+	Topic    string
+	Payload  []byte
+	Retain   bool
+	DUP      bool
+	QoS      byte
+	PacketID uint16
 }
 
 func (p *PublishPacket) Type() PacketType {
 	return PacketTypePublish
+}
+
+// PubAckPacket is a PUBACK packet sent in response to a QoS 1 PUBLISH packet.
+type PubAckPacket struct {
+	PacketID uint16
+}
+
+func (p *PubAckPacket) Type() PacketType {
+	return PacketTypePubAck
 }
 
 // SubscribePacket represents a SUBSCRIBE packet sent by a client to the server.
@@ -129,7 +138,7 @@ func (s *SubAckPacket) Type() PacketType {
 	return PacketTypeSubAck
 }
 
-// UnsubscribePacket represents an UNSUBSCRIBE packet sent by a client to the server.
+// UnsubscribePacket represents an UNSUBSCRIBE packet sent from the client to the server.
 // It contains a packet identifier and a slice of topic filters to unsubscribe from.
 type UnsubscribePacket struct {
 	PacketID uint16

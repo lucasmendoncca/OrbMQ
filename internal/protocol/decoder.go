@@ -18,15 +18,6 @@ type connectFlags struct {
 
 // Decode reads a packet from the given io.Reader and returns the corresponding
 // decoded Packet, or an error if the packet is invalid.
-//
-// The function first reads the fixed header, then reads the remaining
-// length of the packet. Finally, it decodes the packet based on the
-// packet type and the given flags and remaining length.
-//
-// If the packet type is not supported, the function returns an error.
-//
-// If the flags or remaining length are invalid for the given packet
-// type, the function returns an error.
 func Decode(r io.Reader) (Packet, error) {
 	br := bufio.NewReader(r)
 
@@ -56,21 +47,29 @@ func Decode(r io.Reader) (Packet, error) {
 		}
 		return &PingReqPacket{}, nil
 
+	case PacketTypePublish:
+		qos := (flags >> 1) & 0x03
+		if qos == 0x03 {
+			return nil, errors.New("invalid QoS level")
+		}
+		dup := flags&0x08 != 0
+		if qos == 0 && dup {
+			return nil, errors.New("invalid DUP flag for QoS 0")
+		}
+		retain := flags&0x01 != 0
+		return decodePublish(br, remainingLength, qos, dup, retain)
+
+	case PacketTypePubAck:
+		if flags != 0 {
+			return nil, errors.New("invalid PUBACK flags")
+		}
+		return decodePubAck(br, remainingLength)
+
 	case PacketTypeSubscribe:
 		if flags != 0x02 {
 			return nil, errors.New("invalid SUBSCRIBE flags")
 		}
 		return decodeSubscribe(br, remainingLength)
-
-	case PacketTypePublish:
-		qos := (flags >> 1) & 0x03
-		if qos != 0 {
-			return nil, errors.New("only QoS 0 supported")
-		}
-
-		retain := flags&0x01 != 0
-
-		return decodePublish(br, remainingLength, retain)
 
 	case PacketTypeUnsubscribe:
 		if flags != 0x02 {
@@ -131,7 +130,6 @@ func decodeWill(r io.Reader, qos byte, retain bool) (*WillMessage, error) {
 func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 	lr := &io.LimitedReader{R: r, N: int64(remainingLength)}
 
-	// Variable header
 	protoName, err := readUTF8String(lr)
 	if err != nil {
 		return nil, err
@@ -162,7 +160,6 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 		return nil, err
 	}
 
-	// Payload
 	clientID, err := readUTF8String(lr)
 	if err != nil {
 		return nil, err
@@ -213,13 +210,6 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 	}, nil
 }
 
-// decodeSubscribe reads a SUBSCRIBE packet from the given io.Reader.
-// It returns a *SubscribePacket and an error if the packet is invalid.
-// The remainingLength parameter specifies the number of bytes remaining in the packet.
-// If the packet is malformed, an error will be returned.
-// If the packet is valid, a *SubscribePacket will be returned with its fields populated.
-// The *SubscribePacket will contain the packet identifier and a slice of Subscription objects,
-// each of which contains the topic name and QoS level.
 func decodeSubscribe(r io.Reader, remainingLength int) (*SubscribePacket, error) {
 	lr := &io.LimitedReader{
 		R: r,
@@ -268,13 +258,7 @@ func decodeSubscribe(r io.Reader, remainingLength int) (*SubscribePacket, error)
 	}, nil
 }
 
-// decodePublish reads a PUBLISH packet from the given io.Reader.
-// It returns a *PublishPacket and an error if the packet is invalid.
-// The remainingLength parameter specifies the number of bytes remaining in the packet.
-// If the packet is malformed, an error will be returned.
-// If the packet is valid, a *PublishPacket will be returned with its fields populated.
-// The *PublishPacket will contain the topic name and payload.
-func decodePublish(r io.Reader, remainingLength int, retain bool) (*PublishPacket, error) {
+func decodePublish(r io.Reader, remainingLength int, qos byte, dup bool, retain bool) (*PublishPacket, error) {
 	lr := &io.LimitedReader{
 		R: r,
 		N: int64(remainingLength),
@@ -285,19 +269,47 @@ func decodePublish(r io.Reader, remainingLength int, retain bool) (*PublishPacke
 		return nil, err
 	}
 
+	var packetID uint16
+	if qos > 0 {
+		if err := binary.Read(lr, binary.BigEndian, &packetID); err != nil {
+			return nil, err
+		}
+		if packetID == 0 {
+			return nil, errors.New("invalid packet identifier")
+		}
+	}
+
 	payload := make([]byte, lr.N)
 	if _, err := io.ReadFull(lr, payload); err != nil {
 		return nil, err
 	}
 
 	return &PublishPacket{
-		Topic:   topic,
-		Payload: payload,
-		Retain:  retain,
+		Topic:    topic,
+		Payload:  payload,
+		Retain:   retain,
+		DUP:      dup,
+		QoS:      qos,
+		PacketID: packetID,
 	}, nil
 }
 
-// decodeUnsubscribe reads an UNSUBSCRIBE packet from the given io.Reader.
+func decodePubAck(r io.Reader, remainingLength int) (*PubAckPacket, error) {
+	if remainingLength != 2 {
+		return nil, errors.New("invalid PUBACK packet")
+	}
+
+	var packetID uint16
+	if err := binary.Read(r, binary.BigEndian, &packetID); err != nil {
+		return nil, err
+	}
+	if packetID == 0 {
+		return nil, errors.New("invalid packet identifier")
+	}
+
+	return &PubAckPacket{PacketID: packetID}, nil
+}
+
 func decodeUnsubscribe(r io.Reader, remainingLength int) (*UnsubscribePacket, error) {
 	lr := &io.LimitedReader{
 		R: r,

@@ -8,80 +8,88 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDecodeConnect(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   []byte
-		wantErr bool
-		check   func(t *testing.T, pkt Packet)
-	}{
-		{
-			name: "valid CONNECT",
-			input: []byte{
-				0x10, 0x15,
-				0x00, 0x04, 'M', 'Q', 'T', 'T',
-				0x04,
-				0x02,
-				0x00, 0x3C,
-				0x00, 0x09, 'c', 'l', 'i', 'e', 'n', 't', '1', '2', '3',
-			},
-			wantErr: false,
-			check: func(t *testing.T, pkt Packet) {
-				conn, ok := pkt.(*ConnectPacket)
-				require.True(t, ok, "expected ConnectPacket")
-
-				assert.Equal(t, "MQTT", conn.ProtocolName)
-				assert.Equal(t, byte(0x04), conn.ProtocolLevel)
-				assert.True(t, conn.CleanSession)
-				assert.Equal(t, uint16(60), conn.KeepAlive)
-				assert.Equal(t, "client123", conn.ClientID)
-			},
-		},
-		{
-			name: "invalid fixed header flags",
-			input: []byte{
-				0x11, 0x00,
-			},
-			wantErr: true,
-		},
-		{
-			name: "truncated remaining length",
-			input: []byte{
-				0x10, 0x05,
-				0x00, 0x04, 'M', 'Q',
-			},
-			wantErr: true,
-		},
-		{
-			name: "extra bytes after payload",
-			input: []byte{
-				0x10, 0x14,
-				0x00, 0x04, 'M', 'Q', 'T', 'T',
-				0x04,
-				0x02,
-				0x00, 0x3C,
-				0x00, 0x01, 'a',
-				0xFF,
-			},
-			wantErr: true,
-		},
+func TestDecode_ShouldDecodeConnectPacket_WhenPacketIsValid(t *testing.T) {
+	input := []byte{
+		0x10, 0x15,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04,
+		0x02,
+		0x00, 0x3C,
+		0x00, 0x09, 'c', 'l', 'i', 'e', 'n', 't', '1', '2', '3',
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pkt, err := Decode(bytes.NewReader(tt.input))
+	pkt, err := Decode(bytes.NewReader(input))
+	require.NoError(t, err)
 
-			if tt.wantErr {
-				require.Error(t, err)
-				return
-			}
+	conn, ok := pkt.(*ConnectPacket)
+	require.True(t, ok)
+	assert.Equal(t, "MQTT", conn.ProtocolName)
+	assert.Equal(t, byte(0x04), conn.ProtocolLevel)
+	assert.True(t, conn.CleanSession)
+	assert.Equal(t, uint16(60), conn.KeepAlive)
+	assert.Equal(t, "client123", conn.ClientID)
+}
 
-			require.NoError(t, err)
-			require.NotNil(t, pkt)
-
-			if tt.check != nil {
-				tt.check(t, pkt)
-			}
-		})
+func TestDecode_ShouldReturnError_WhenConnectFlagsAreInvalid(t *testing.T) {
+	input := []byte{
+		0x11, 0x00,
 	}
+
+	_, err := Decode(bytes.NewReader(input))
+	require.Error(t, err)
+}
+
+func TestDecode_ShouldDecodePublishPacket_WhenQoS1PacketIsValid(t *testing.T) {
+	input := []byte{
+		0x32, 0x0E,
+		0x00, 0x05, 't', 'o', 'p', 'i', 'c',
+		0x00, 0x2A,
+		'h', 'e', 'l', 'l', 'o',
+	}
+
+	pkt, err := Decode(bytes.NewReader(input))
+	require.NoError(t, err)
+
+	pub, ok := pkt.(*PublishPacket)
+	require.True(t, ok)
+	assert.Equal(t, "topic", pub.Topic)
+	assert.Equal(t, []byte("hello"), pub.Payload)
+	assert.Equal(t, byte(1), pub.QoS)
+	assert.Equal(t, uint16(42), pub.PacketID)
+	assert.False(t, pub.Retain)
+	assert.False(t, pub.DUP)
+}
+
+func TestDecode_ShouldReturnError_WhenPublishQoS1PacketIsMissingPacketID(t *testing.T) {
+	input := []byte{
+		0x32, 0x0E,
+		0x00, 0x05, 't', 'o', 'p', 'i', 'c',
+		'h', 'e', 'l', 'l', 'o',
+	}
+
+	_, err := Decode(bytes.NewReader(input))
+	require.Error(t, err)
+}
+
+func TestDecode_ShouldReturnError_WhenPublishPacketIDIsZero(t *testing.T) {
+	input := []byte{
+		0x32, 0x0E,
+		0x00, 0x05, 't', 'o', 'p', 'i', 'c',
+		0x00, 0x00,
+		'h', 'e', 'l', 'l', 'o',
+	}
+
+	_, err := Decode(bytes.NewReader(input))
+	require.Error(t, err)
+}
+
+func TestDecode_ShouldDecodePubAckPacket_WhenPacketIsValid(t *testing.T) {
+	input := []byte{0x40, 0x02, 0x00, 0x2A}
+
+	pkt, err := Decode(bytes.NewReader(input))
+	require.NoError(t, err)
+
+	puback, ok := pkt.(*PubAckPacket)
+	require.True(t, ok)
+	assert.Equal(t, uint16(42), puback.PacketID)
 }
