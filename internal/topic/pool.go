@@ -4,6 +4,6 @@ import "sync"
 
 var subsPool = sync.Pool{
 	New: func() any {
-		return make([]Subscriber, 0, 16)
+		return make([]Subscription, 0, 16)
 	},
 }

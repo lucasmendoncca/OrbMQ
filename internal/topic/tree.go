@@ -6,7 +6,7 @@ type Tree struct {
 
 type node struct {
 	children map[string]*node
-	subs     map[string]Subscriber
+	subs     map[string]Subscription
 }
 
 type Subscriber interface {
@@ -14,23 +14,23 @@ type Subscriber interface {
 	Enqueue([]byte) error
 }
 
+type Subscription struct {
+	ClientID   string
+	Subscriber Subscriber
+	QoS        byte
+}
+
 func NewTree() *Tree {
 	return &Tree{
 		root: &node{
 			children: make(map[string]*node),
-			subs:     make(map[string]Subscriber),
+			subs:     make(map[string]Subscription),
 		},
 	}
 }
 
-// Subscribe adds a client to the tree's subscription list.
-// It will receive all messages published to topics that match the filter.
-// The filter string is a topic name, or a topic name with a single-level or
-// multi-level wildcard. For example: "foo/bar", "foo/+", "foo/#".
-// A client can subscribe to multiple topics by calling Subscribe multiple times.
-// If a client is already subscribed to a topic, calling Subscribe again will not
-// cause the client to receive duplicate messages.
-func (t *Tree) Subscribe(filter string, sub Subscriber) {
+// Subscribe adds a client subscription to the tree.
+func (t *Tree) Subscribe(filter string, sub Subscription) {
 	levels := splitFilter(filter)
 
 	cur := t.root
@@ -38,42 +38,39 @@ func (t *Tree) Subscribe(filter string, sub Subscriber) {
 		if cur.children[lvl] == nil {
 			cur.children[lvl] = &node{
 				children: make(map[string]*node),
-				subs:     make(map[string]Subscriber),
+				subs:     make(map[string]Subscription),
 			}
 		}
 		cur = cur.children[lvl]
 	}
 
-	cur.subs[sub.ID()] = sub
+	cur.subs[sub.ClientID] = sub
 }
 
-// Clone returns a deep copy of the tree. It is used by the
-// Broker's Clone function to create a copy of the tree.
-// The returned tree is a new, independent copy of the original tree.
+// Clone returns a deep copy of the tree.
 func (t *Tree) Clone() *Tree {
 	return &Tree{
 		root: t.root.clone(),
 	}
 }
 
-// Match returns a list of subscribers that are subscribed to the given topic.
-// The topic string can contain single-level or multi-level wildcards.
-// For example, "foo/bar", "foo/+", "foo/#".
-// If no subscribers match the given topic, an empty list is returned.
-func (t *Tree) Match(topic string) []Subscriber {
-	subs := subsPool.Get().([]Subscriber)
-	subs = subs[:0]
+// Match returns unique subscriptions that match the given topic.
+// If a client matches through multiple filters, the highest granted QoS wins.
+func (t *Tree) Match(topic string) []Subscription {
+	matched := make(map[string]Subscription)
+	t.match(t.root, topic, 0, matched)
 
-	t.match(t.root, topic, 0, &subs)
+	subs := subsPool.Get().([]Subscription)
+	subs = subs[:0]
+	for _, sub := range matched {
+		subs = append(subs, sub)
+	}
+
 	return subs
 }
 
-// PutSubs returns a slice of Subscribers to the subsPool, to be reused
-// by the Match function. It is used to avoid unnecessary memory allocations
-// when the Match function is called with a large number of subscribers.
-// If the capacity of the slice is greater than 1024, the slice is not returned to
-// the pool, as it is unlikely to be reused.
-func PutSubs(subs []Subscriber) {
+// PutSubs returns a slice of subscriptions to the pool.
+func PutSubs(subs []Subscription) {
 	if cap(subs) > 1024 {
 		return
 	}
@@ -97,18 +94,14 @@ func (t *Tree) Unsubscribe(filter string, clientID string) {
 }
 
 // UnsubscribeAll removes all subscriptions for the given clientID from the tree.
-// It is used by the Broker's UnsubscribeAll function to remove all subscriptions
-// for a client when the client disconnects.
 func (t *Tree) UnsubscribeAll(clientID string) {
 	t.unsubscribeAll(t.root, clientID)
 }
 
-// clone returns a deep copy of the node. It is used by the Tree's
-// Clone function to create a copy of the tree.
 func (n *node) clone() *node {
 	nn := &node{
 		children: make(map[string]*node, len(n.children)),
-		subs:     make(map[string]Subscriber, len(n.subs)),
+		subs:     make(map[string]Subscription, len(n.subs)),
 	}
 
 	for k, v := range n.children {
@@ -122,24 +115,18 @@ func (n *node) clone() *node {
 	return nn
 }
 
-// match is a helper function that returns a list of subscribers that are
-// subscribed to the given topic. It is used by the Match function to
-// recursively traverse the tree and find matching subscribers.
-//
-// The function takes a node, a slice of strings representing the topic
-// levels, and a slice of Subscribers to store the matching subscribers.
-func (t *Tree) match(n *node, topic string, idx int, out *[]Subscriber) {
+func (t *Tree) match(n *node, topic string, idx int, out map[string]Subscription) {
 	if n == nil {
 		return
 	}
 
 	if idx >= len(topic) {
 		for _, sub := range n.subs {
-			*out = append(*out, sub)
+			t.addMatch(out, sub)
 		}
 		if hash := n.children["#"]; hash != nil {
 			for _, sub := range hash.subs {
-				*out = append(*out, sub)
+				t.addMatch(out, sub)
 			}
 		}
 		return
@@ -159,23 +146,23 @@ func (t *Tree) match(n *node, topic string, idx int, out *[]Subscriber) {
 		nextIdx = next
 	}
 
-	// exact match
 	t.match(n.children[level], topic, nextIdx, out)
-
-	// '+'
 	t.match(n.children["+"], topic, nextIdx, out)
 
-	// '#'
 	if hash := n.children["#"]; hash != nil {
 		for _, sub := range hash.subs {
-			*out = append(*out, sub)
+			t.addMatch(out, sub)
 		}
 	}
 }
 
-// unsubscribeAll removes all subscriptions for the given clientID from the tree.
-// It is used by the Broker's UnsubscribeAll function to remove all subscriptions
-// for a client when the client disconnects.
+func (t *Tree) addMatch(out map[string]Subscription, sub Subscription) {
+	existing, ok := out[sub.ClientID]
+	if !ok || sub.QoS > existing.QoS {
+		out[sub.ClientID] = sub
+	}
+}
+
 func (t *Tree) unsubscribeAll(n *node, clientID string) {
 	if n == nil {
 		return
