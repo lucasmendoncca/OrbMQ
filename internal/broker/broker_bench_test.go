@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
+	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 )
 
 type mockSub struct {
@@ -18,67 +19,47 @@ func (m *mockSub) Enqueue(_ []byte) error {
 	return nil
 }
 
-func setupBroker(numSubs int) *Broker {
+func setupBroker(numSubs int, qos byte) *Broker {
 	b := New()
 
-	sub := &mockSub{id: "sub-1"}
-
 	for i := 0; i < numSubs; i++ {
-		b.Subscribe("sensors/+", sub)
+		sub := &mockSub{id: "sub-" + string(rune('a'+i))}
+		b.Subscribe("sensors/+", qos, sub)
 	}
 
 	return b
 }
 
-func BenchmarkBrokerPublish(b *testing.B) {
-	broker := setupBroker(1)
+func benchmarkBrokerPublish(b *testing.B, numSubs int, qos byte) {
+	broker := setupBroker(numSubs, qos)
 
 	pub := &protocol.PublishPacket{
 		Topic:   "sensors/temp",
 		Payload: []byte("25.3"),
+		QoS:     qos,
 	}
-
-	raw := []byte("fake-mqtt-publish")
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		broker.Publish(pub, raw)
+		broker.Publish(pub, func(sub topic.Subscription) error {
+			return sub.Subscriber.Enqueue([]byte("fake-mqtt-publish"))
+		})
 	}
 }
 
-func BenchmarkBrokerPublish_10Subs(b *testing.B) {
-	broker := setupBroker(10)
-
-	pub := &protocol.PublishPacket{
-		Topic:   "sensors/temp",
-		Payload: []byte("25.3"),
-	}
-
-	raw := []byte("fake-mqtt-publish")
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		broker.Publish(pub, raw)
-	}
+func BenchmarkBrokerPublish_QoS0(b *testing.B) {
+	benchmarkBrokerPublish(b, 1, 0)
 }
 
-func BenchmarkBrokerPublish_Parallel(b *testing.B) {
-	broker := setupBroker(10)
+func BenchmarkBrokerPublish_QoS1(b *testing.B) {
+	benchmarkBrokerPublish(b, 1, 1)
+}
 
-	pub := &protocol.PublishPacket{
-		Topic:   "sensors/temp",
-		Payload: []byte("25.3"),
-	}
+func BenchmarkBrokerPublish_10Subs_QoS0(b *testing.B) {
+	benchmarkBrokerPublish(b, 10, 0)
+}
 
-	raw := []byte("fake-mqtt-publish")
-
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			broker.Publish(pub, raw)
-		}
-	})
+func BenchmarkBrokerPublish_10Subs_QoS1(b *testing.B) {
+	benchmarkBrokerPublish(b, 10, 1)
 }
