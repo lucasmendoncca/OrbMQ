@@ -18,22 +18,46 @@ import (
 // errDisconnect is returned by serve when the client sends a DISCONNECT packet.
 var errDisconnect = errors.New("client disconnected")
 
+type Option func(*Server)
+
 type Server struct {
-	addr     string
-	broker   *broker.Broker
-	sessions *session.Store
+	addr            string
+	broker          *broker.Broker
+	sessions        *session.Store
+	listenFn        func(network, addr string) (net.Listener, error)
+	encodePublishFn func(pub *protocol.PublishPacket) ([]byte, error)
 }
 
-func New(addr string, b *broker.Broker, sessions *session.Store) *Server {
-	return &Server{
-		addr:     addr,
-		broker:   b,
-		sessions: sessions,
+func New(addr string, b *broker.Broker, sessions *session.Store, opts ...Option) *Server {
+	srv := &Server{
+		addr:            addr,
+		broker:          b,
+		sessions:        sessions,
+		listenFn:        net.Listen,
+		encodePublishFn: encodePublishPacket,
+	}
+
+	for _, opt := range opts {
+		opt(srv)
+	}
+
+	return srv
+}
+
+func WithListener(fn func(network, addr string) (net.Listener, error)) Option {
+	return func(s *Server) {
+		s.listenFn = fn
+	}
+}
+
+func WithPublishEncoder(fn func(pub *protocol.PublishPacket) ([]byte, error)) Option {
+	return func(s *Server) {
+		s.encodePublishFn = fn
 	}
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.addr)
+	ln, err := s.listenFn("tcp", s.addr)
 	if err != nil {
 		return err
 	}
@@ -313,7 +337,7 @@ func (s *Server) sendRetained(cli *client.Client, sess *session.State, filter st
 
 func (s *Server) replayInflight(cli *client.Client, sess *session.State) error {
 	for _, pub := range sess.ReplayPending() {
-		raw, err := encodePublishPacket(pub)
+		raw, err := s.encodePublishFn(pub)
 		if err != nil {
 			return err
 		}
@@ -335,7 +359,7 @@ func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *
 		rawPub = tracked
 	}
 
-	raw, err := encodePublishPacket(rawPub)
+	raw, err := s.encodePublishFn(rawPub)
 	if err != nil {
 		if rawPub.QoS == 1 {
 			sess.Ack(rawPub.PacketID)
