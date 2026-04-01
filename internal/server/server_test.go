@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -16,8 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestHandleConn_ShouldDeliverQoS1PublishAndReplyPubAck_WhenSubscriberRequestsQoS1(t *testing.T) {
-	srv := newTestServer()
+func TestStart_ShouldAcknowledgeQoS1PublishAndDeliverToSubscriber_WhenSubscriberRequestsQoS1(t *testing.T) {
+	srv := startTestServer(t)
 
 	subConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "sub-qos1", cleanSession: false})
 	defer subConn.Close()
@@ -49,8 +50,8 @@ func TestHandleConn_ShouldDeliverQoS1PublishAndReplyPubAck_WhenSubscriberRequest
 	assert.False(t, pub.DUP)
 }
 
-func TestHandleConn_ShouldDowngradeDeliveryQoS_WhenSubscriptionQoSIsLowerThanPublish(t *testing.T) {
-	srv := newTestServer()
+func TestStart_ShouldDowngradeDeliveryQoS_WhenSubscriptionQoSIsLowerThanPublish(t *testing.T) {
+	srv := startTestServer(t)
 
 	subConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "sub-qos0", cleanSession: true})
 	defer subConn.Close()
@@ -76,8 +77,8 @@ func TestHandleConn_ShouldDowngradeDeliveryQoS_WhenSubscriptionQoSIsLowerThanPub
 	assert.Equal(t, uint16(0), pub.PacketID)
 }
 
-func TestHandleConn_ShouldReplayInflightPublishWithDup_WhenPersistentSessionReconnects(t *testing.T) {
-	srv := newTestServer()
+func TestStart_ShouldReplayInflightPublishWithDup_WhenPersistentSessionReconnects(t *testing.T) {
+	srv := startTestServer(t)
 
 	subConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "persistent-sub", cleanSession: false})
 	assert.False(t, sessionPresent)
@@ -124,12 +125,39 @@ func TestHandleConn_ShouldReplayInflightPublishWithDup_WhenPersistentSessionReco
 	assertNoPacket(t, reconnectedAgain)
 }
 
-func TestHandleConn_ShouldDeliverRetainedPublishWithQoS1_WhenSubscriberRequestsQoS1(t *testing.T) {
-	srv := newTestServer()
+func TestStart_ShouldDiscardInflightState_WhenPersistentClientReconnectsWithCleanSession(t *testing.T) {
+	srv := startTestServer(t)
+
+	subConn, _ := connectClient(t, srv, connectOptions{clientID: "clean-reset", cleanSession: false})
+	subscribe(t, subConn, 1, "reset/+", 1, []byte{1})
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "reset-pub", cleanSession: true})
+	defer pubConn.Close()
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "reset/topic",
+		Payload:  []byte("pending"),
+		QoS:      1,
+		PacketID: 17,
+	})
+
+	_ = decodeClientPacket(t, pubConn)
+	_ = decodeClientPacket(t, subConn)
+	_ = subConn.Close()
+
+	cleanConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "clean-reset", cleanSession: true})
+	defer cleanConn.Close()
+	assert.False(t, sessionPresent)
+	assertNoPacket(t, cleanConn)
+}
+
+func TestStart_ShouldDeliverRetainedPublishWithQoS1_WhenSubscriberRequestsQoS1(t *testing.T) {
+	srv := startTestServer(t)
 
 	pubConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "retained-pub", cleanSession: true})
 	defer pubConn.Close()
 	assert.False(t, sessionPresent)
+
 	writePublish(t, pubConn, &protocol.PublishPacket{
 		Topic:    "retained/topic",
 		Payload:  []byte("state"),
@@ -142,18 +170,20 @@ func TestHandleConn_ShouldDeliverRetainedPublishWithQoS1_WhenSubscriberRequestsQ
 	subConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "retained-sub", cleanSession: true})
 	defer subConn.Close()
 	assert.False(t, sessionPresent)
-	subscribe(t, subConn, 1, "retained/#", 1, []byte{1})
 
-	retained := decodeClientPacket(t, subConn)
-	pub, ok := retained.(*protocol.PublishPacket)
-	require.True(t, ok)
+	setDeadline(t, subConn)
+	_, err := subConn.Write(encodeSubscribePacket(t, 1, "retained/#", 1))
+	require.NoError(t, err)
+
+	pub := readPublishWithinPackets(t, subConn, 2)
+	require.NotNil(t, pub)
 	assert.True(t, pub.Retain)
 	assert.Equal(t, byte(1), pub.QoS)
 	assert.NotZero(t, pub.PacketID)
 }
 
-func TestHandleConn_ShouldDeliverWillWithQoS1_WhenClientDisconnectsUnexpectedly(t *testing.T) {
-	srv := newTestServer()
+func TestStart_ShouldDeliverWillWithQoS1_WhenClientDisconnectsUnexpectedly(t *testing.T) {
+	srv := startTestServer(t)
 
 	subConn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "will-sub", cleanSession: true})
 	defer subConn.Close()
@@ -181,23 +211,452 @@ func TestHandleConn_ShouldDeliverWillWithQoS1_WhenClientDisconnectsUnexpectedly(
 	assert.Equal(t, byte(1), pub.QoS)
 }
 
+func TestStart_ShouldReplyWithPingResp_WhenClientSendsPingReq(t *testing.T) {
+	srv := startTestServer(t)
+
+	conn, _ := connectClient(t, srv, connectOptions{clientID: "ping-client", cleanSession: true})
+	defer conn.Close()
+
+	setDeadline(t, conn)
+	_, err := conn.Write([]byte{0xC0, 0x00})
+	require.NoError(t, err)
+
+	packet := readPacketBytes(t, conn)
+	assert.Equal(t, []byte{0xD0, 0x00}, packet)
+}
+
+func TestStart_ShouldGrantQoS1_WhenClientSubscribesWithQoS2(t *testing.T) {
+	srv := startTestServer(t)
+
+	conn, _ := connectClient(t, srv, connectOptions{clientID: "sub-grant", cleanSession: true})
+	defer conn.Close()
+
+	subscribe(t, conn, 1, "grant/+", 2, []byte{1})
+}
+
+func TestStart_ShouldStopDeliveringMessages_WhenClientUnsubscribes(t *testing.T) {
+	srv := startTestServer(t)
+
+	subConn, _ := connectClient(t, srv, connectOptions{clientID: "unsub-client", cleanSession: true})
+	defer subConn.Close()
+	subscribe(t, subConn, 1, "unsub/topic", 1, []byte{1})
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "unsub-pub", cleanSession: true})
+	defer pubConn.Close()
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "unsub/topic",
+		Payload:  []byte("before"),
+		QoS:      1,
+		PacketID: 23,
+	})
+	_ = decodeClientPacket(t, pubConn)
+	_ = decodeClientPacket(t, subConn)
+
+	setDeadline(t, subConn)
+	_, err := subConn.Write(encodeUnsubscribePacketForTest(t, 3, "unsub/topic"))
+	require.NoError(t, err)
+	packet := readPacketBytes(t, subConn)
+	assert.Equal(t, []byte{0xB0, 0x02, 0x00, 0x03}, packet)
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "unsub/topic",
+		Payload:  []byte("after"),
+		QoS:      1,
+		PacketID: 24,
+	})
+	_ = decodeClientPacket(t, pubConn)
+
+	assertNoPacket(t, subConn)
+}
+
+func TestStart_ShouldCloseConnection_WhenFirstPacketIsNotConnect(t *testing.T) {
+	srv := startTestServer(t)
+
+	conn := openClientConn(t, srv)
+	defer conn.Close()
+
+	setDeadline(t, conn)
+	_, err := conn.Write([]byte{0xC0, 0x00})
+	require.NoError(t, err)
+
+	assertNoPacket(t, conn)
+}
+
+func TestStart_ShouldCloseConnection_WhenConnectPacketIsMalformed(t *testing.T) {
+	srv := startTestServer(t)
+
+	conn := openClientConn(t, srv)
+	defer conn.Close()
+
+	setDeadline(t, conn)
+	_, err := conn.Write([]byte{0x10, 0x01, 0x00})
+	require.NoError(t, err)
+
+	assertNoPacket(t, conn)
+}
+
+func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := &scriptConn{
+		readChunks: [][]byte{encodeConnectPacket(t, connectOptions{clientID: "connack-fail", cleanSession: true})},
+		writeErr:   io.ErrClosedPipe,
+	}
+
+	accepted := false
+	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
+		return &stubListener{
+			acceptFn: func() (net.Conn, error) {
+				if accepted {
+					<-ctx.Done()
+					return nil, errStubNet
+				}
+				accepted = true
+				cancel()
+				return conn, nil
+			},
+			closeFn: func() error { return nil },
+			addrFn:  func() net.Addr { return stubAddr("listener") },
+		}, nil
+	}))
+
+	err := srv.Start(ctx)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return conn.writeCalls >= 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestStart_ShouldStopConnectionAfterReplayInflightEncodingFails_WhenPersistentSessionReconnects(t *testing.T) {
+	srv := startTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+		return nil, errors.New("encode failed")
+	}))
+
+	state, _ := srv.srv.sessions.GetOrCreate("replay-fail")
+	_, err := state.TrackOutbound(&protocol.PublishPacket{
+		Topic:   "replay/topic",
+		Payload: []byte("x"),
+		QoS:     1,
+	})
+	require.NoError(t, err)
+
+	conn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "replay-fail", cleanSession: false})
+	defer conn.Close()
+
+	assert.True(t, sessionPresent)
+	assertConnectionEventuallyClosed(t, conn, 2*time.Second)
+}
+
+func TestStart_ShouldCloseConnectionAfterKeepAliveTimeout_WhenClientStopsSendingPackets(t *testing.T) {
+	srv := startTestServer(t)
+
+	conn, sessionPresent := connectClient(t, srv, connectOptions{
+		clientID:     "keepalive-timeout",
+		cleanSession: true,
+		keepAlive:    1,
+	})
+	defer conn.Close()
+
+	assert.False(t, sessionPresent)
+	assertConnectionEventuallyClosed(t, conn, 3*time.Second)
+}
+
+func TestStart_ShouldClosePublisherConnectionWithoutPubAck_WhenOutboundEncodingFails(t *testing.T) {
+	srv := startTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+		if pub.Topic == "encode/fail" {
+			return nil, errors.New("encode failed")
+		}
+		return encodePublishPacket(pub)
+	}))
+
+	subConn, _ := connectClient(t, srv, connectOptions{clientID: "encode-fail-sub", cleanSession: false})
+	defer subConn.Close()
+	subscribe(t, subConn, 1, "encode/+", 1, []byte{1})
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "encode-fail-pub", cleanSession: true})
+	defer pubConn.Close()
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "encode/fail",
+		Payload:  []byte("value"),
+		QoS:      1,
+		PacketID: 31,
+	})
+
+	assertConnectionEventuallyClosed(t, pubConn, 2*time.Second)
+}
+
+func TestStart_ShouldCloseSubscriberConnectionWithoutSubAck_WhenRetainedDeliveryExhaustsPacketIDs(t *testing.T) {
+	srv := startTestServer(t)
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "retained-source", cleanSession: true})
+	defer pubConn.Close()
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "retained/exhaust",
+		Payload:  []byte("value"),
+		Retain:   true,
+		QoS:      1,
+		PacketID: 33,
+	})
+	_ = decodeClientPacket(t, pubConn)
+
+	subConn, _ := connectClient(t, srv, connectOptions{clientID: "retained-exhaust", cleanSession: false})
+	defer subConn.Close()
+
+	state, ok := srv.srv.sessions.Get("retained-exhaust")
+	require.True(t, ok)
+	exhaustPacketIDs(t, state)
+
+	setDeadline(t, subConn)
+	_, err := subConn.Write(encodeSubscribePacket(t, 1, "retained/#", 1))
+	require.NoError(t, err)
+
+	assertConnectionEventuallyClosed(t, subConn, 2*time.Second)
+}
+
+func TestNew_ShouldApplyFunctionalOptions_WhenProvided(t *testing.T) {
+	listenerFn := func(network, addr string) (net.Listener, error) {
+		return nil, errors.New("listen override")
+	}
+	encoderFn := func(pub *protocol.PublishPacket) ([]byte, error) {
+		return []byte("encoded"), nil
+	}
+
+	srv := newTestServer(
+		WithListener(listenerFn),
+		WithPublishEncoder(encoderFn),
+	)
+
+	assert.NotNil(t, srv)
+	_, err := srv.listenFn("tcp", ":0")
+	require.EqualError(t, err, "listen override")
+
+	raw, err := srv.encodePublishFn(&protocol.PublishPacket{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte("encoded"), raw)
+}
+
+func TestStart_ShouldReturnError_WhenListenFails(t *testing.T) {
+	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
+		return nil, errors.New("listen failed")
+	}))
+
+	err := srv.Start(context.Background())
+	require.EqualError(t, err, "listen failed")
+}
+
+func TestStart_ShouldContinueAfterAcceptError_AndReturnNilWhenContextIsDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	acceptCalls := 0
+	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
+		return &stubListener{
+			acceptFn: func() (net.Conn, error) {
+				acceptCalls++
+				if acceptCalls == 1 {
+					cancel()
+				}
+				return nil, errStubNet
+			},
+			closeFn: func() error { return nil },
+			addrFn:  func() net.Addr { return stubAddr("listener") },
+		}, nil
+	}))
+
+	err := srv.Start(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, acceptCalls)
+}
+
+func TestStart_ShouldContinueAfterAcceptError_WhenContextIsStillActive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	acceptCalls := 0
+	conn := &scriptConn{readChunks: [][]byte{{0x00}}}
+	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
+		return &stubListener{
+			acceptFn: func() (net.Conn, error) {
+				acceptCalls++
+				switch acceptCalls {
+				case 1:
+					return nil, errStubNet
+				case 2:
+					cancel()
+					return conn, nil
+				default:
+					return nil, errStubNet
+				}
+			},
+			closeFn: func() error { return nil },
+			addrFn:  func() net.Addr { return stubAddr("listener") },
+		}, nil
+	}))
+
+	err := srv.Start(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, acceptCalls)
+}
+
+func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := &scriptConn{
+		readChunks: [][]byte{{0x00}},
+		writeErr:   io.ErrClosedPipe,
+	}
+
+	acceptCalls := 0
+	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
+		return &stubListener{
+			acceptFn: func() (net.Conn, error) {
+				acceptCalls++
+				if acceptCalls == 1 {
+					cancel()
+					return conn, nil
+				}
+				return nil, errStubNet
+			},
+			closeFn: func() error { return nil },
+			addrFn:  func() net.Addr { return stubAddr("listener") },
+		}, nil
+	}))
+
+	err := srv.Start(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, acceptCalls)
+}
+
+type stubListener struct {
+	acceptFn func() (net.Conn, error)
+	closeFn  func() error
+	addrFn   func() net.Addr
+}
+
+func (l *stubListener) Accept() (net.Conn, error) { return l.acceptFn() }
+func (l *stubListener) Close() error              { return l.closeFn() }
+func (l *stubListener) Addr() net.Addr            { return l.addrFn() }
+
+type stubAddr string
+
+func (a stubAddr) Network() string { return "tcp" }
+func (a stubAddr) String() string  { return string(a) }
+
+type stubNetError struct{}
+
+func (stubNetError) Error() string   { return "temporary accept error" }
+func (stubNetError) Timeout() bool   { return false }
+func (stubNetError) Temporary() bool { return true }
+
+var errStubNet = stubNetError{}
+
+type scriptConn struct {
+	readChunks     [][]byte
+	readErr        error
+	writes         bytes.Buffer
+	writeErr       error
+	writeCalls     int
+	deadlineWasSet bool
+	readIndex      int
+}
+
+func (c *scriptConn) Read(p []byte) (int, error) {
+	if c.readIndex < len(c.readChunks) {
+		chunk := c.readChunks[c.readIndex]
+		c.readIndex++
+		n := copy(p, chunk)
+		return n, nil
+	}
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	return 0, io.EOF
+}
+
+func (c *scriptConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return c.writes.Write(p)
+}
+
+func (c *scriptConn) Close() error                     { return nil }
+func (c *scriptConn) LocalAddr() net.Addr              { return stubAddr("local") }
+func (c *scriptConn) RemoteAddr() net.Addr             { return stubAddr("remote") }
+func (c *scriptConn) SetDeadline(time.Time) error      { c.deadlineWasSet = true; return nil }
+func (c *scriptConn) SetReadDeadline(time.Time) error  { c.deadlineWasSet = true; return nil }
+func (c *scriptConn) SetWriteDeadline(time.Time) error { return nil }
+
 type connectOptions struct {
 	clientID     string
 	cleanSession bool
+	keepAlive    uint16
 	will         *protocol.WillMessage
 }
 
-func newTestServer() *Server {
-	return New(":0", broker.New(), session.New())
+type runningServer struct {
+	srv    *Server
+	addr   string
+	ln     net.Listener
+	cancel context.CancelFunc
+	errCh  chan error
 }
 
-func connectClient(t *testing.T, srv *Server, opts connectOptions) (net.Conn, bool) {
+func newTestServer(opts ...Option) *Server {
+	return New(":0", broker.New(), session.New(), opts...)
+}
+
+func startTestServer(t *testing.T, opts ...Option) *runningServer {
 	t.Helper()
 
-	serverConn, clientConn := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	errCh := make(chan error, 1)
 
-	go srv.handleConn(context.Background(), serverConn)
+	listenerOpt := WithListener(func(network, addr string) (net.Listener, error) {
+		return ln, nil
+	})
 
+	allOpts := append([]Option{listenerOpt}, opts...)
+	rs := &runningServer{
+		srv:    New(":0", broker.New(), session.New(), allOpts...),
+		addr:   ln.Addr().String(),
+		ln:     ln,
+		cancel: cancel,
+		errCh:  errCh,
+	}
+
+	go func() {
+		errCh <- rs.srv.Start(ctx)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+		require.NoError(t, <-errCh)
+	})
+
+	return rs
+}
+
+func openClientConn(t *testing.T, srv *runningServer) net.Conn {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", srv.addr)
+	require.NoError(t, err)
+	return conn
+}
+
+func connectClient(t *testing.T, srv *runningServer, opts connectOptions) (net.Conn, bool) {
+	t.Helper()
+
+	clientConn := openClientConn(t, srv)
 	setDeadline(t, clientConn)
 	_, err := clientConn.Write(encodeConnectPacket(t, opts))
 	require.NoError(t, err)
@@ -253,6 +712,25 @@ func decodeClientPacket(t *testing.T, conn net.Conn) protocol.Packet {
 	pkt, err := protocol.Decode(bytes.NewReader(packet))
 	require.NoError(t, err)
 	return pkt
+}
+
+func readPublishWithinPackets(t *testing.T, conn net.Conn, maxPackets int) *protocol.PublishPacket {
+	t.Helper()
+
+	for range maxPackets {
+		packet := readPacketBytes(t, conn)
+		pkt, err := protocol.Decode(bytes.NewReader(packet))
+		if err != nil {
+			continue
+		}
+
+		pub, ok := pkt.(*protocol.PublishPacket)
+		if ok {
+			return pub
+		}
+	}
+
+	return nil
 }
 
 func readPacketBytes(t *testing.T, conn net.Conn) []byte {
@@ -315,6 +793,26 @@ func assertNoPacket(t *testing.T, conn net.Conn) {
 	assert.True(t, netErr.Timeout())
 }
 
+func assertConnectionEventuallyClosed(t *testing.T, conn net.Conn, wait time.Duration) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		_ = conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf)
+		if err == nil {
+			return false
+		}
+
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return false
+		}
+
+		return true
+	}, wait, 50*time.Millisecond)
+}
+
 func setDeadline(t *testing.T, conn net.Conn) {
 	t.Helper()
 	require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
@@ -344,7 +842,11 @@ func encodeConnectPacket(t *testing.T, opts connectOptions) []byte {
 	writeUTF8(t, &variable, "MQTT")
 	require.NoError(t, variable.WriteByte(0x04))
 	require.NoError(t, variable.WriteByte(flags))
-	require.NoError(t, binary.Write(&variable, binary.BigEndian, uint16(60)))
+	keepAlive := opts.keepAlive
+	if keepAlive == 0 {
+		keepAlive = 60
+	}
+	require.NoError(t, binary.Write(&variable, binary.BigEndian, keepAlive))
 
 	remainingLength := variable.Len() + payload.Len()
 
@@ -369,6 +871,22 @@ func encodeSubscribePacket(t *testing.T, packetID uint16, filter string, qos byt
 
 	var packet bytes.Buffer
 	require.NoError(t, packet.WriteByte(0x82))
+	writeRemainingLength(t, &packet, payload.Len())
+	_, err := packet.Write(payload.Bytes())
+	require.NoError(t, err)
+
+	return packet.Bytes()
+}
+
+func encodeUnsubscribePacketForTest(t *testing.T, packetID uint16, filter string) []byte {
+	t.Helper()
+
+	var payload bytes.Buffer
+	require.NoError(t, binary.Write(&payload, binary.BigEndian, packetID))
+	writeUTF8(t, &payload, filter)
+
+	var packet bytes.Buffer
+	require.NoError(t, packet.WriteByte(0xA2))
 	writeRemainingLength(t, &packet, payload.Len())
 	_, err := packet.Write(payload.Bytes())
 	require.NoError(t, err)
@@ -404,5 +922,18 @@ func writeRemainingLength(t *testing.T, w io.Writer, length int) {
 		if length == 0 {
 			return
 		}
+	}
+}
+
+func exhaustPacketIDs(t *testing.T, sess *session.State) {
+	t.Helper()
+
+	for i := 0; i < 65535; i++ {
+		_, err := sess.TrackOutbound(&protocol.PublishPacket{
+			Topic:   "exhaust/topic",
+			Payload: []byte("x"),
+			QoS:     1,
+		})
+		require.NoError(t, err)
 	}
 }
