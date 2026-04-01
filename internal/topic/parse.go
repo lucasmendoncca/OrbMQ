@@ -52,14 +52,12 @@ func splitFilter(s string) []string {
 	return res
 }
 
-/*************  ✨ Windsurf Command ⭐  *************/
 // splitTopic takes a string and splits it into a slice of strings using the '/' character
 // as a delimiter. It returns a slice of strings containing the split parts of the
 // original string. For example, the string "foo/bar" would be split into the slice
 // ["foo", "bar"]. If the original string does not contain any '/' characters, a
 // slice containing a single string element is returned. For example, the string "foo"
 // would be split into the slice ["foo"].
-/*******  9d6043d7-8f04-459b-9c39-66b784fabc49  *******/
 func splitTopic(topic string) []string {
 	var res []string
 	start := 0
