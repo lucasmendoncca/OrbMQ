@@ -1,6 +1,7 @@
 package session
 
 import (
+	"cmp"
 	"errors"
 	"slices"
 	"sync"
@@ -97,14 +98,7 @@ func (s *State) SnapshotSubscriptions() []Subscription {
 	}
 
 	slices.SortFunc(subs, func(a, b Subscription) int {
-		switch {
-		case a.Filter < b.Filter:
-			return -1
-		case a.Filter > b.Filter:
-			return 1
-		default:
-			return 0
-		}
+		return cmp.Compare(a.Filter, b.Filter)
 	})
 
 	return subs
