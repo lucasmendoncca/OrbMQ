@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"maps"
+	"sync"
 	"sync/atomic"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/client"
@@ -11,8 +12,11 @@ import (
 )
 
 type Broker struct {
-	topics   atomic.Value
-	retained atomic.Value
+	// Writers serialize each copy-on-write update; readers use immutable snapshots.
+	topicsMu   sync.Mutex
+	topics     atomic.Value
+	retainedMu sync.Mutex
+	retained   atomic.Value
 }
 
 func New() *Broker {
@@ -24,6 +28,9 @@ func New() *Broker {
 
 // Subscribe adds a client subscription to the broker.
 func (b *Broker) Subscribe(filter string, qos byte, sub topic.Subscriber) {
+	b.topicsMu.Lock()
+	defer b.topicsMu.Unlock()
+
 	oldTree := b.topics.Load().(*topic.Tree)
 
 	newTree := oldTree.Clone()
@@ -59,6 +66,9 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, deliver func(topic.Subscri
 
 // Unsubscribe removes the client's subscription for the given filter only.
 func (b *Broker) Unsubscribe(filter string, clientID string) {
+	b.topicsMu.Lock()
+	defer b.topicsMu.Unlock()
+
 	oldTree := b.topics.Load().(*topic.Tree)
 
 	newTree := oldTree.Clone()
@@ -69,6 +79,9 @@ func (b *Broker) Unsubscribe(filter string, clientID string) {
 
 // UnsubscribeAll removes all subscriptions for the given clientID from the broker.
 func (b *Broker) UnsubscribeAll(clientID string) {
+	b.topicsMu.Lock()
+	defer b.topicsMu.Unlock()
+
 	oldTree := b.topics.Load().(*topic.Tree)
 
 	newTree := oldTree.Clone()
@@ -95,6 +108,9 @@ func (b *Broker) RetainedMatching(filter string) []*protocol.PublishPacket {
 }
 
 func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
+	b.retainedMu.Lock()
+	defer b.retainedMu.Unlock()
+
 	oldMap := b.retained.Load().(map[string]*protocol.PublishPacket)
 
 	newMap := make(map[string]*protocol.PublishPacket, len(oldMap))

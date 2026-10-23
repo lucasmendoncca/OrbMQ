@@ -2,6 +2,8 @@ package broker
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/client"
@@ -106,6 +108,120 @@ func TestBrokerUnsubscribeAll_ShouldStopDeliveringMessagesAcrossAllFilters_WhenC
 	}
 
 	assert.Empty(t, delivered)
+}
+
+func TestBrokerPublish_ShouldPreserveSubscriptionChanges_WhenWritersRunConcurrently(t *testing.T) {
+	const clients = 64
+	testCases := []struct {
+		name   string
+		remove func(*Broker, string)
+		add    bool
+	}{
+		{name: "subscribe", add: true},
+		{name: "unsubscribe", remove: func(b *Broker, id string) { b.Unsubscribe("sensors/+", id) }},
+		{name: "unsubscribe all", remove: func(b *Broker, id string) { b.UnsubscribeAll(id) }},
+		{name: "mixed", remove: func(b *Broker, id string) { b.UnsubscribeAll(id) }, add: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := New()
+			for i := range clients {
+				if tc.remove != nil {
+					b.Subscribe("sensors/+", 1, &stubSubscriber{id: fmt.Sprintf("old-%d", i)})
+				}
+			}
+
+			start := make(chan struct{})
+			var writers sync.WaitGroup
+			for i := range clients {
+				writers.Go(func() {
+					<-start
+					if tc.remove != nil {
+						tc.remove(b, fmt.Sprintf("old-%d", i))
+					}
+					if tc.add {
+						b.Subscribe("sensors/+", 1, &stubSubscriber{id: fmt.Sprintf("new-%d", i)})
+					}
+				})
+			}
+			close(start)
+			writers.Wait()
+
+			var expected, delivered []string
+			if tc.add {
+				for i := range clients {
+					expected = append(expected, fmt.Sprintf("new-%d", i))
+				}
+			}
+			b.Publish(&protocol.PublishPacket{Topic: "sensors/temp"}, func(sub topic.Subscription) error {
+				delivered = append(delivered, sub.ClientID)
+				return nil
+			})
+			assert.ElementsMatch(t, expected, delivered)
+		})
+	}
+}
+
+func TestBrokerRetainedMatching_ShouldPreserveRetainedChanges_WhenWritersRunConcurrently(t *testing.T) {
+	const messages = 64
+	testCases := []struct {
+		name   string
+		remove bool
+		add    bool
+	}{
+		{name: "add", add: true},
+		{name: "delete", remove: true},
+		{name: "mixed", remove: true, add: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := New()
+			deliver := func(topic.Subscription) error { return nil }
+			if tc.remove {
+				for i := range messages {
+					b.Publish(&protocol.PublishPacket{
+						Topic: fmt.Sprintf("sensors/old-%d", i), Payload: []byte("old"), Retain: true,
+					}, deliver)
+				}
+			}
+
+			start := make(chan struct{})
+			var writers sync.WaitGroup
+			for i := range messages {
+				writers.Go(func() {
+					<-start
+					if tc.remove {
+						b.Publish(&protocol.PublishPacket{
+							Topic: fmt.Sprintf("sensors/old-%d", i), Retain: true,
+						}, deliver)
+					}
+					if tc.add {
+						b.Publish(&protocol.PublishPacket{
+							Topic:   fmt.Sprintf("sensors/new-%d", i),
+							Payload: []byte(fmt.Sprintf("value-%d", i)),
+							Retain:  true,
+						}, deliver)
+					}
+				})
+			}
+			close(start)
+			writers.Wait()
+
+			expected := make(map[string]string)
+			if tc.add {
+				for i := range messages {
+					expected[fmt.Sprintf("sensors/new-%d", i)] = fmt.Sprintf("value-%d", i)
+				}
+			}
+			actual := make(map[string]string)
+			for _, pub := range b.RetainedMatching("sensors/#") {
+				actual[pub.Topic] = string(pub.Payload)
+			}
+			assert.Equal(t, expected, actual)
+		})
+	}
 }
 
 func TestBrokerRetainedMatching_ShouldReturnDefensiveCopies_WhenRetainedMessagesExist(t *testing.T) {
