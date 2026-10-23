@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -23,11 +24,28 @@ var errDisconnect = errors.New("client disconnected")
 type Option func(*Server)
 
 type Server struct {
-	addr            string
-	broker          *broker.Broker
-	sessions        *session.Store
-	listenFn        func(network, addr string) (net.Listener, error)
-	encodePublishFn func(pub *protocol.PublishPacket) ([]byte, error)
+	addr             string
+	broker           *broker.Broker
+	sessions         *session.Store
+	listenFn         func(network, addr string) (net.Listener, error)
+	encodePublishFn  func(pub *protocol.PublishPacket) ([]byte, error)
+	handshakeTimeout time.Duration
+	clientsMu        sync.RWMutex
+	clients          map[string]*activeConnection
+}
+
+type activeConnection struct {
+	client       *client.Client
+	session      *session.State
+	cleanSession bool
+	closing      bool
+	done         chan struct{}
+}
+
+type connectionGroup struct {
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
+	handlers    sync.WaitGroup
 }
 
 type publishTemplate struct {
@@ -48,11 +66,13 @@ var publishEncodeBufferPool = sync.Pool{
 
 func New(addr string, b *broker.Broker, sessions *session.Store, opts ...Option) *Server {
 	srv := &Server{
-		addr:            addr,
-		broker:          b,
-		sessions:        sessions,
-		listenFn:        net.Listen,
-		encodePublishFn: encodePublishPacket,
+		addr:             addr,
+		broker:           b,
+		sessions:         sessions,
+		listenFn:         net.Listen,
+		encodePublishFn:  encodePublishPacket,
+		handshakeTimeout: 10 * time.Second,
+		clients:          make(map[string]*activeConnection),
 	}
 
 	for _, opt := range opts {
@@ -74,40 +94,127 @@ func WithPublishEncoder(fn func(pub *protocol.PublishPacket) ([]byte, error)) Op
 	}
 }
 
+// WithHandshakeTimeout limits CONNECT parsing and the initial CONNACK write.
+// The timeout must be positive.
+func WithHandshakeTimeout(timeout time.Duration) Option {
+	return func(s *Server) { s.handshakeTimeout = timeout }
+}
+
 func (s *Server) Start(ctx context.Context) error {
+	if s.handshakeTimeout <= 0 {
+		return errors.New("handshake timeout must be positive")
+	}
 	ln, err := s.listenFn("tcp", s.addr)
 	if err != nil {
 		return err
 	}
-	defer ln.Close()
+	runCtx, cancel := context.WithCancel(ctx)
+	connections := &connectionGroup{connections: make(map[net.Conn]struct{})}
+	shutdownDone := make(chan struct{})
+	context.AfterFunc(runCtx, func() {
+		defer close(shutdownDone)
+		_ = ln.Close()
+		connections.closeAll()
+	})
+	defer func() {
+		cancel()
+		<-shutdownDone
+		connections.wait()
+	}()
 
 	log.Printf("Listening on %s", s.addr)
+	return s.acceptConnections(ctx, runCtx, ln, connections)
+}
 
+func (s *Server) acceptConnections(ctx, runCtx context.Context, ln net.Listener, connections *connectionGroup) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return nil
-			default:
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Temporary() {
 				log.Printf("accept error: %v", err)
 				continue
 			}
+			return fmt.Errorf("accept connection: %w", err)
 		}
 
-		go s.handleConn(ctx, conn)
+		if !connections.start(ctx, conn, func() { s.handleConn(runCtx, conn) }) {
+			return nil
+		}
 	}
 }
 
+func (g *connectionGroup) start(ctx context.Context, conn net.Conn, handle func()) bool {
+	g.mu.Lock()
+	if ctx.Err() != nil {
+		g.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	g.connections[conn] = struct{}{}
+	g.handlers.Add(1)
+	g.mu.Unlock()
+	go func() {
+		defer g.handlers.Done()
+		defer func() {
+			g.mu.Lock()
+			delete(g.connections, conn)
+			g.mu.Unlock()
+		}()
+		handle()
+	}()
+	return true
+}
+
+func (g *connectionGroup) closeAll() {
+	g.mu.Lock()
+	conns := make([]net.Conn, 0, len(g.connections))
+	for conn := range g.connections {
+		conns = append(conns, conn)
+	}
+	g.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func (g *connectionGroup) wait() {
+	g.handlers.Wait()
+}
+
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
+	if err := conn.SetDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return
+	}
 	reader := bufio.NewReader(conn)
 	connect, cli, err := s.handshake(conn, reader)
 	if err != nil {
+		_ = conn.Close()
 		return
 	}
+	var owner *activeConnection
+	defer func() {
+		if owner != nil {
+			s.clientsMu.Lock()
+			owner.closing = true
+			s.clientsMu.Unlock()
+		}
+		cli.Close()
+		cli.Wait()
+		if owner != nil {
+			s.closeSession(owner)
+		}
+	}()
 
-	sess, sessionPresent := s.openSession(connect)
-	defer s.closeSession(connect, cli)
+	owner, sessionPresent, err := s.acquireConnection(ctx, connect, cli)
+	if err != nil {
+		return
+	}
+	sess := owner.session
 
 	log.Printf("client connected: %s (cleanSession=%v, sessionPresent=%v)",
 		cli.ID(), connect.CleanSession, sessionPresent)
@@ -117,6 +224,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		ReturnCode:     protocol.ConnAckAccepted,
 	}); err != nil {
 		log.Printf("connack error: %v", err)
+		return
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("clear handshake deadline: %v", err)
 		return
 	}
 
@@ -168,14 +279,47 @@ func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, b
 	return s.sessions.GetOrCreate(connect.ClientID)
 }
 
-// closeSession persists or discards the session and cleans up the client.
-func (s *Server) closeSession(connect *protocol.ConnectPacket, cli *client.Client) {
-	if connect.CleanSession {
-		s.sessions.Delete(connect.ClientID)
+// acquireConnection waits for the previous owner's handlers, writer and cleanup
+// before opening a session. No network I/O or waiting holds clientsMu.
+func (s *Server) acquireConnection(ctx context.Context, connect *protocol.ConnectPacket, cli *client.Client) (*activeConnection, bool, error) {
+	for {
+		s.clientsMu.Lock()
+		if err := ctx.Err(); err != nil {
+			s.clientsMu.Unlock()
+			return nil, false, err
+		}
+		previous := s.clients[cli.ID()]
+		if previous == nil {
+			state, present := s.openSession(connect)
+			owner := &activeConnection{client: cli, session: state, cleanSession: connect.CleanSession, done: make(chan struct{})}
+			s.clients[cli.ID()] = owner
+			s.clientsMu.Unlock()
+			return owner, present, nil
+		}
+		previous.closing = true
+		s.clientsMu.Unlock()
+		previous.client.Close()
+		select {
+		case <-previous.done:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 	}
+}
 
-	s.broker.UnsubscribeAll(cli.ID())
-	cli.Close()
+// closeSession releases only this connection's resources, after its writer exits.
+func (s *Server) closeSession(owner *activeConnection) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	id := owner.client.ID()
+	if s.clients[id] == owner {
+		if owner.cleanSession {
+			s.sessions.Delete(id)
+		}
+		s.broker.UnsubscribeAll(id)
+		delete(s.clients, id)
+	}
+	close(owner.done)
 }
 
 // serve runs the main packet loop. Returns true if the client disconnected
@@ -308,6 +452,10 @@ func (s *Server) handlePublish(cli *client.Client, p *protocol.PublishPacket) er
 }
 
 func (s *Server) publishMessage(p *protocol.PublishPacket) error {
+	// Keep snapshot delivery and slow-client eviction within one ownership epoch.
+	// Concurrent publishers share this read lock; takeover and cleanup are writers.
+	s.clientsMu.RLock()
+	defer s.clientsMu.RUnlock()
 	cache := &publishDeliveryCache{}
 	var publishErr error
 
@@ -359,10 +507,12 @@ func (s *Server) replayInflight(cli *client.Client, sess *session.State) error {
 }
 
 func (s *Server) deliverPublishToSubscriber(pub *protocol.PublishPacket, sub topic.Subscription, cache *publishDeliveryCache) error {
-	state, ok := s.sessions.Get(sub.ClientID)
-	if !ok {
+	// publishMessage holds clientsMu while the broker walks its subscriber snapshot.
+	owner := s.clients[sub.ClientID]
+	if owner == nil || owner.closing || owner.client != sub.Subscriber {
 		return nil
 	}
+	state := owner.session
 
 	deliveryQoS := deliveryQoS(pub.QoS, sub.QoS)
 	outbound := newOutboundPublish(pub, deliveryQoS)

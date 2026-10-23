@@ -92,6 +92,12 @@ Some notable implementation choices in the current broker:
   - a full queue rejects new packets immediately; the server closes the affected connection for control or replay failures, and evicts slow subscribers during fan-out
 - **Subscriber abstraction**
   - the broker depends on an interface instead of a concrete client type
+- **Connection lifecycle and ownership**
+  - CONNECT parsing and the initial CONNACK write have a 10-second deadline, configurable with `server.WithHandshakeTimeout`
+  - cancellation closes the listener and all connections, including incomplete handshakes; `Start` waits for connection handlers and writers to exit
+  - shutdown interrupts pending writes rather than draining queues; persistent in-memory sessions retain unacknowledged QoS 1 messages
+  - replacing a Client ID closes its previous connection and waits for its cleanup before opening the new session
+  - a shared registry read lock keeps each fan-out and slow-client eviction within the same ownership lifetime; concurrent publishers can still run together
 - **Allocation-aware publish path**
   - pooling is used to reduce pressure on hot-path subscriber matching
 

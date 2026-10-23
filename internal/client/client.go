@@ -16,6 +16,7 @@ type Client struct {
 
 	sendQ     chan queuedWrite
 	done      chan struct{}
+	writeDone chan struct{}
 	closeOnce sync.Once
 }
 
@@ -26,10 +27,11 @@ type queuedWrite struct {
 
 func New(id string, conn net.Conn) *Client {
 	c := &Client{
-		id:    id,
-		conn:  conn,
-		sendQ: make(chan queuedWrite, 1024),
-		done:  make(chan struct{}),
+		id:        id,
+		conn:      conn,
+		sendQ:     make(chan queuedWrite, 1024),
+		done:      make(chan struct{}),
+		writeDone: make(chan struct{}),
 	}
 
 	go c.writeLoop()
@@ -96,11 +98,17 @@ func (c *Client) Close() {
 	})
 }
 
+// Wait waits for the writer to exit. Call Close first to interrupt blocked I/O.
+func (c *Client) Wait() {
+	<-c.writeDone
+}
+
 // writeLoop is a goroutine that writes data from the client's sendQ channel
 // to the underlying connection. It will block until the write is complete, and
 // will return if an error is encountered during the write. If the client's
 // done channel is closed, writeLoop will return.
 func (c *Client) writeLoop() {
+	defer close(c.writeDone)
 	for {
 		select {
 		case write := <-c.sendQ:

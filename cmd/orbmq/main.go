@@ -24,12 +24,8 @@ func main() {
 	sessions := session.New()
 	srv := server.New(":1883", broker, sessions)
 
-	go func() {
-		if err := srv.Start(ctx); err != nil {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	<-ctx.Done()
-	log.Println("shutting down")
+	if err := srv.Start(ctx); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+	log.Println("server stopped")
 }

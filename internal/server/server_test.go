@@ -20,6 +20,246 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStart_ShouldWaitForWriterExit_WhenContextIsCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t)
+		serverConn, conn := net.Pipe()
+		defer conn.Close()
+		writeReturned := make(chan struct{})
+		releaseWriter := make(chan struct{})
+		unblockWriter := sync.OnceFunc(func() { close(releaseWriter) })
+		defer unblockWriter()
+		connections <- &delayedWriteExitConn{Conn: serverConn, returned: writeReturned, release: releaseWriter}
+		setDeadline(t, conn)
+		_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: "blocked", cleanSession: true}))
+		require.NoError(t, err)
+		synctest.Wait()
+		stopped := make(chan struct{})
+		go func() { stop(); close(stopped) }()
+		<-writeReturned
+		synctest.Wait()
+		select {
+		case <-stopped:
+			t.Error("server returned while a connection writer was still running")
+		default:
+		}
+		unblockWriter()
+		<-stopped
+	})
+}
+
+func TestStart_ShouldWaitForPreviousWriter_WhenClientIDIsReplaced(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t)
+		defer stop()
+		writeReturned := make(chan struct{})
+		releaseWriter := make(chan struct{})
+		unblockWriter := sync.OnceFunc(func() { close(releaseWriter) })
+		defer unblockWriter()
+		serverConn, old := net.Pipe()
+		defer old.Close()
+		connections <- &delayedWriteExitConn{Conn: serverConn, returned: writeReturned, release: releaseWriter}
+		setDeadline(t, old)
+		_, err := old.Write(encodeConnectPacket(t, connectOptions{clientID: "same-id", cleanSession: true}))
+		require.NoError(t, err)
+		readConnAck(t, old)
+		subscribe(t, old, 1, "takeover/#", 0, []byte{0})
+		pub, _ := connectPipeClient(t, connections, "publisher")
+		defer pub.Close()
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "takeover/value", Payload: []byte("pending"), QoS: 1, PacketID: 7})
+		_ = decodeClientPacket(t, pub)
+		synctest.Wait()
+		newServer, replacement := net.Pipe()
+		defer replacement.Close()
+		observed := &observedWriteConn{Conn: newServer, writeGate: make(chan struct{}, 1)}
+		connections <- observed
+		setDeadline(t, replacement)
+		_, err = replacement.Write(encodeConnectPacket(t, connectOptions{clientID: "same-id", cleanSession: true}))
+		require.NoError(t, err)
+		<-writeReturned
+		synctest.Wait()
+		assert.Zero(t, observed.writing.Load(), "replacement must wait for the previous writer")
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "takeover/value", Payload: []byte("during handoff"), QoS: 1, PacketID: 9})
+		assert.Equal(t, []byte{0x40, 0x02, 0x00, 0x09}, readPacketBytes(t, pub))
+		unblockWriter()
+		assert.False(t, readConnAck(t, replacement))
+		subscribe(t, replacement, 2, "takeover/#", 0, []byte{0})
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "takeover/value", Payload: []byte("new owner"), QoS: 1, PacketID: 8})
+		_ = decodeClientPacket(t, pub)
+		packet := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+		assert.Equal(t, []byte("new owner"), packet.Payload)
+	})
+}
+
+func TestStart_ShouldStopAccept_WhenContextIsCancelled(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	acceptStarted := make(chan struct{})
+	srv := newTestServer(WithListener(func(string, string) (net.Listener, error) {
+		return &stubListener{
+			acceptFn: func() (net.Conn, error) { close(acceptStarted); return ln.Accept() },
+			closeFn:  ln.Close,
+			addrFn:   ln.Addr,
+		}, nil
+	}))
+	result := make(chan error, 1)
+	go func() { result <- srv.Start(ctx) }()
+	<-acceptStarted
+	cancel()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not interrupt accept on cancellation")
+	}
+}
+
+func TestStart_ShouldClearHandshakeDeadline_WhenKeepAliveIsZero(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t, WithHandshakeTimeout(time.Second))
+		defer stop()
+		conn, _ := connectPipeClient(t, connections, "no-keepalive")
+		defer conn.Close()
+		time.Sleep(2 * time.Second)
+		setDeadline(t, conn)
+		_, err := conn.Write([]byte{0xC0, 0x00})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, conn))
+	})
+}
+
+func TestStart_ShouldPreserveNewOwnerResources_WhenClientIDIsReplaced(t *testing.T) {
+	testCases := []struct {
+		name     string
+		oldClean bool
+		newClean bool
+	}{
+		{name: "persistent to persistent"},
+		{name: "persistent to clean", newClean: true},
+		{name: "clean to persistent", oldClean: true},
+		{name: "clean to clean", oldClean: true, newClean: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, connections, stop := startPipeTestServer(t)
+				defer stop()
+				oldServer, old := net.Pipe()
+				defer old.Close()
+				connections <- oldServer
+				setDeadline(t, old)
+				_, err := old.Write(encodeConnectPacket(t, connectOptions{clientID: "same-id", cleanSession: tc.oldClean}))
+				require.NoError(t, err)
+				assert.False(t, readConnAck(t, old))
+				subscribe(t, old, 1, "takeover/#", 1, []byte{1})
+				publisher, _ := connectPipeClient(t, connections, "publisher")
+				defer publisher.Close()
+				writePublish(t, publisher, &protocol.PublishPacket{Topic: "takeover/value", Payload: []byte("pending"), QoS: 1, PacketID: 7})
+				_ = decodeClientPacket(t, publisher)
+				pending := decodeClientPacket(t, old)
+
+				newServer, replacement := net.Pipe()
+				defer replacement.Close()
+				connections <- newServer
+				setDeadline(t, replacement)
+				_, err = replacement.Write(encodeConnectPacket(t, connectOptions{clientID: "same-id", cleanSession: tc.newClean}))
+				require.NoError(t, err)
+				resume := !tc.oldClean && !tc.newClean
+				assert.Equal(t, resume, readConnAck(t, replacement))
+				if resume {
+					replayed := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+					assert.Equal(t, pending.(*protocol.PublishPacket).PacketID, replayed.PacketID)
+					assert.Equal(t, []byte("pending"), replayed.Payload)
+					assert.True(t, replayed.DUP)
+				} else {
+					subscribe(t, replacement, 2, "takeover/#", 1, []byte{1})
+				}
+				_, err = old.Read(make([]byte, 1))
+				assert.ErrorIs(t, err, io.EOF)
+				_ = old.Close()
+				synctest.Wait()
+				_, err = replacement.Write([]byte{0xC0, 0x00})
+				require.NoError(t, err)
+				assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, replacement))
+				writePublish(t, publisher, &protocol.PublishPacket{Topic: "takeover/value", Payload: []byte("new owner"), QoS: 1, PacketID: 8})
+				_ = decodeClientPacket(t, publisher)
+				delivered := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+				assert.Equal(t, []byte("new owner"), delivered.Payload)
+				assert.False(t, delivered.DUP)
+			})
+		})
+	}
+}
+
+func TestStart_ShouldCloseConnection_WhenHandshakeTimesOut(t *testing.T) {
+	testCases := []struct {
+		name    string
+		request func(*testing.T) []byte
+		timeout time.Duration
+	}{
+		{name: "silent peer", request: func(*testing.T) []byte { return nil }},
+		{name: "partial header", request: func(*testing.T) []byte { return []byte{0x10, 0x80} }},
+		{name: "partial body", request: func(*testing.T) []byte { return []byte{0x10, 0x0C, 0x00, 0x04} }},
+		{name: "blocked connack", request: func(t *testing.T) []byte {
+			return encodeConnectPacket(t, connectOptions{clientID: "blocked", cleanSession: true})
+		}},
+		{name: "configured timeout", timeout: time.Second, request: func(*testing.T) []byte { return nil }},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				timeout := 10 * time.Second
+				var opts []Option
+				if tc.timeout > 0 {
+					timeout = tc.timeout
+					opts = append(opts, WithHandshakeTimeout(timeout))
+				}
+				_, connections, stop := startPipeTestServer(t, opts...)
+				defer stop()
+				serverConn, conn := net.Pipe()
+				defer conn.Close()
+				connections <- serverConn
+				require.NoError(t, conn.SetDeadline(time.Now().Add(timeout+time.Second)))
+				if request := tc.request(t); len(request) > 0 {
+					_, err := conn.Write(request)
+					require.NoError(t, err)
+				}
+				time.Sleep(timeout)
+				synctest.Wait()
+				_, err := conn.Read(make([]byte, 1))
+				require.ErrorIs(t, err, io.EOF)
+			})
+		})
+	}
+}
+
+func TestStart_ShouldCloseAllConnections_WhenContextIsCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t)
+		idleServer, idle := net.Pipe()
+		defer idle.Close()
+		setDeadline(t, idle)
+		connections <- idleServer
+		blockedServer, blocked := net.Pipe()
+		defer blocked.Close()
+		connections <- blockedServer
+		setDeadline(t, blocked)
+		_, err := blocked.Write(encodeConnectPacket(t, connectOptions{clientID: "blocked", cleanSession: true}))
+		require.NoError(t, err)
+		connected, _ := connectPipeClient(t, connections, "connected")
+		defer connected.Close()
+		synctest.Wait()
+		stop()
+		for _, conn := range []net.Conn{idle, blocked, connected} {
+			_, err := conn.Read(make([]byte, 1))
+			assert.ErrorIs(t, err, io.EOF)
+		}
+	})
+}
+
 func TestStart_ShouldSerializeResponsesAndDeliveries_WhenSubscriberWriteIsBlocked(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -514,7 +754,7 @@ func TestStart_ShouldCloseConnection_WhenFirstPacketIsNotConnect(t *testing.T) {
 	_, err := conn.Write([]byte{0xC0, 0x00})
 	require.NoError(t, err)
 
-	assertNoPacket(t, conn)
+	assertConnectionEventuallyClosed(t, conn, time.Second)
 }
 
 func TestStart_ShouldCloseConnection_WhenConnectPacketIsMalformed(t *testing.T) {
@@ -527,7 +767,7 @@ func TestStart_ShouldCloseConnection_WhenConnectPacketIsMalformed(t *testing.T) 
 	_, err := conn.Write([]byte{0x10, 0x01, 0x00})
 	require.NoError(t, err)
 
-	assertNoPacket(t, conn)
+	assertConnectionEventuallyClosed(t, conn, time.Second)
 }
 
 func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.T) {
@@ -537,6 +777,7 @@ func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.
 	conn := &scriptConn{
 		readChunks: [][]byte{encodeConnectPacket(t, connectOptions{clientID: "connack-fail", cleanSession: true})},
 		writeErr:   io.ErrClosedPipe,
+		onWrite:    cancel,
 	}
 
 	accepted := false
@@ -548,7 +789,6 @@ func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.
 					return nil, errStubNet
 				}
 				accepted = true
-				cancel()
 				return conn, nil
 			},
 			closeFn: func() error { return nil },
@@ -558,9 +798,7 @@ func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.
 
 	err := srv.Start(ctx)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		return conn.writeCalls.Load() >= 1
-	}, time.Second, 10*time.Millisecond)
+	assert.GreaterOrEqual(t, conn.writeCalls.Load(), int32(1))
 }
 
 func TestStart_ShouldStopConnectionAfterReplayInflightEncodingFails_WhenPersistentSessionReconnects(t *testing.T) {
@@ -754,6 +992,62 @@ func TestNew_ShouldApplyFunctionalOptions_WhenProvided(t *testing.T) {
 	assert.Equal(t, []byte("encoded"), raw)
 }
 
+func TestStart_ShouldReturnError_WhenHandshakeTimeoutIsNotPositive(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			srv := newTestServer(WithHandshakeTimeout(timeout), WithListener(func(string, string) (net.Listener, error) {
+				t.Fatal("invalid configuration must fail before listening")
+				return nil, nil
+			}))
+			require.EqualError(t, srv.Start(context.Background()), "handshake timeout must be positive")
+		})
+	}
+}
+
+func TestStart_ShouldCloseConnections_WhenAcceptFailsPermanently(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serverConn, conn := net.Pipe()
+		defer conn.Close()
+		acceptErr := errors.New("accept failed")
+		accepted := false
+		srv := newTestServer(WithListener(func(string, string) (net.Listener, error) {
+			return &stubListener{
+				acceptFn: func() (net.Conn, error) {
+					if !accepted {
+						accepted = true
+						return serverConn, nil
+					}
+					return nil, acceptErr
+				},
+				closeFn: func() error { return nil },
+				addrFn:  func() net.Addr { return stubAddr("pipe") },
+			}, nil
+		}))
+		require.ErrorIs(t, srv.Start(context.Background()), acceptErr)
+		_, err := conn.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+	})
+}
+
+func TestStart_ShouldCloseAcceptedConnection_WhenCancellationWinsAccept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		serverConn, conn := net.Pipe()
+		defer conn.Close()
+		srv := newTestServer(WithListener(func(string, string) (net.Listener, error) {
+			return &stubListener{
+				acceptFn: func() (net.Conn, error) { cancel(); return serverConn, nil },
+				closeFn:  func() error { return nil },
+				addrFn:   func() net.Addr { return stubAddr("pipe") },
+			}, nil
+		}))
+		require.NoError(t, srv.Start(ctx))
+		_, err := conn.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+	})
+}
+
 func TestStart_ShouldReturnError_WhenListenFails(t *testing.T) {
 	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
 		return nil, errors.New("listen failed")
@@ -792,7 +1086,7 @@ func TestStart_ShouldContinueAfterAcceptError_WhenContextIsStillActive(t *testin
 	defer cancel()
 
 	acceptCalls := 0
-	conn := &scriptConn{readChunks: [][]byte{{0x00}}}
+	conn := &scriptConn{readChunks: [][]byte{{0x00}}, onClose: cancel}
 	srv := newTestServer(WithListener(func(network, addr string) (net.Listener, error) {
 		return &stubListener{
 			acceptFn: func() (net.Conn, error) {
@@ -801,9 +1095,9 @@ func TestStart_ShouldContinueAfterAcceptError_WhenContextIsStillActive(t *testin
 				case 1:
 					return nil, errStubNet
 				case 2:
-					cancel()
 					return conn, nil
 				default:
+					<-ctx.Done()
 					return nil, errStubNet
 				}
 			},
@@ -815,6 +1109,7 @@ func TestStart_ShouldContinueAfterAcceptError_WhenContextIsStillActive(t *testin
 	err := srv.Start(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 3, acceptCalls)
+	assert.Positive(t, conn.readIndex)
 }
 
 func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T) {
@@ -824,6 +1119,7 @@ func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T
 	conn := &scriptConn{
 		readChunks: [][]byte{{0x00}},
 		writeErr:   io.ErrClosedPipe,
+		onClose:    cancel,
 	}
 
 	acceptCalls := 0
@@ -832,9 +1128,9 @@ func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T
 			acceptFn: func() (net.Conn, error) {
 				acceptCalls++
 				if acceptCalls == 1 {
-					cancel()
 					return conn, nil
 				}
+				<-ctx.Done()
 				return nil, errStubNet
 			},
 			closeFn: func() error { return nil },
@@ -845,6 +1141,7 @@ func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T
 	err := srv.Start(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 2, acceptCalls)
+	assert.Positive(t, conn.readIndex)
 }
 
 // Pipe connections make blocked writes and concurrent handlers deterministic in synctest.
@@ -884,6 +1181,22 @@ func connectPipeClient(t *testing.T, connections chan<- net.Conn, id string) (ne
 	require.NoError(t, err)
 	readConnAck(t, conn)
 	return conn, observed
+}
+
+// Delay return after network cancellation to verify the server joins its writer.
+type delayedWriteExitConn struct {
+	net.Conn
+	returned chan<- struct{}
+	release  <-chan struct{}
+}
+
+func (c *delayedWriteExitConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		close(c.returned)
+		<-c.release
+	}
+	return n, err
 }
 
 type observedWriteConn struct {
@@ -935,6 +1248,8 @@ type scriptConn struct {
 	writeCalls     atomic.Int32
 	deadlineWasSet bool
 	readIndex      int
+	onWrite        func()
+	onClose        func()
 }
 
 func (c *scriptConn) Read(p []byte) (int, error) {
@@ -952,13 +1267,21 @@ func (c *scriptConn) Read(p []byte) (int, error) {
 
 func (c *scriptConn) Write(p []byte) (int, error) {
 	c.writeCalls.Add(1)
+	if c.onWrite != nil {
+		c.onWrite()
+	}
 	if c.writeErr != nil {
 		return 0, c.writeErr
 	}
 	return c.writes.Write(p)
 }
 
-func (c *scriptConn) Close() error                     { return nil }
+func (c *scriptConn) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
 func (c *scriptConn) LocalAddr() net.Addr              { return stubAddr("local") }
 func (c *scriptConn) RemoteAddr() net.Addr             { return stubAddr("remote") }
 func (c *scriptConn) SetDeadline(time.Time) error      { c.deadlineWasSet = true; return nil }
@@ -1215,11 +1538,7 @@ func encodeConnectPacket(t *testing.T, opts connectOptions) []byte {
 	writeUTF8(t, &variable, "MQTT")
 	require.NoError(t, variable.WriteByte(0x04))
 	require.NoError(t, variable.WriteByte(flags))
-	keepAlive := opts.keepAlive
-	if keepAlive == 0 {
-		keepAlive = 60
-	}
-	require.NoError(t, binary.Write(&variable, binary.BigEndian, keepAlive))
+	require.NoError(t, binary.Write(&variable, binary.BigEndian, opts.keepAlive))
 
 	remainingLength := variable.Len() + payload.Len()
 
