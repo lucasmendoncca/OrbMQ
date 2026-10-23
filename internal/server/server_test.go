@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
@@ -17,6 +19,176 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestStart_ShouldSerializeResponsesAndDeliveries_WhenSubscriberWriteIsBlocked(t *testing.T) {
+	testCases := []struct {
+		name     string
+		request  func(*testing.T) []byte
+		response []byte
+	}{
+		{name: "ping", request: func(*testing.T) []byte { return []byte{0xC0, 0x00} }, response: []byte{0xD0, 0x00}},
+		{name: "subscribe", request: func(t *testing.T) []byte {
+			return encodeSubscribePacket(t, 2, "other/#", 0)
+		}, response: []byte{0x90, 0x03, 0x00, 0x02, 0x00}},
+		{name: "unsubscribe", request: func(t *testing.T) []byte {
+			return encodeUnsubscribePacketForTest(t, 3, "sensors/#")
+		}, response: []byte{0xB0, 0x02, 0x00, 0x03}},
+		{name: "publish", request: func(t *testing.T) []byte {
+			var buf bytes.Buffer
+			require.NoError(t, protocol.EncodePublish(&buf, &protocol.PublishPacket{
+				Topic: "other/value", Payload: []byte("value"), QoS: 1, PacketID: 4,
+			}))
+			return buf.Bytes()
+		}, response: []byte{0x40, 0x02, 0x00, 0x04}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, connections, stop := startPipeTestServer(t)
+				defer stop()
+				sub, observed := connectPipeClient(t, connections, "slow-sub")
+				defer sub.Close()
+				subscribe(t, sub, 1, "sensors/#", 0, []byte{0})
+				pub, _ := connectPipeClient(t, connections, "publisher")
+				defer pub.Close()
+
+				writePublish(t, pub, &protocol.PublishPacket{
+					Topic: "sensors/temp", Payload: []byte("pending"), QoS: 1, PacketID: 7,
+				})
+				assert.Equal(t, []byte{0x40, 0x02, 0x00, 0x07}, readPacketBytes(t, pub))
+				synctest.Wait()
+				require.Equal(t, int32(1), observed.writing.Load())
+
+				_, err := sub.Write(tc.request(t))
+				require.NoError(t, err)
+				synctest.Wait()
+				assert.False(t, observed.concurrent.Load(), "responses must use the same writer as deliveries")
+
+				packet := decodeClientPacket(t, sub)
+				delivery, ok := packet.(*protocol.PublishPacket)
+				require.True(t, ok)
+				assert.Equal(t, []byte("pending"), delivery.Payload)
+				assert.Equal(t, tc.response, readPacketBytes(t, sub))
+			})
+		})
+	}
+}
+
+func TestStart_ShouldSendConnAckThenReplayBeforeLiveDeliveries_WhenSessionReconnects(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		replayStarted := make(chan struct{})
+		releaseReplay := make(chan struct{})
+		unblockReplay := sync.OnceFunc(func() { close(releaseReplay) })
+		srv, connections, stop := startPipeTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+			if pub.DUP && string(pub.Payload) == "first" {
+				close(replayStarted)
+				<-releaseReplay
+			}
+			return encodePublishPacket(pub)
+		}))
+		defer stop()
+		defer unblockReplay()
+		state, _ := srv.sessions.GetOrCreate("persistent-sub")
+		state.SetSubscription("sensors/#", 1)
+		for _, payload := range []string{"first", "second"} {
+			_, err := state.TrackOutbound(&protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte(payload), QoS: 1})
+			require.NoError(t, err)
+		}
+		pub, _ := connectPipeClient(t, connections, "publisher")
+		defer pub.Close()
+		serverConn, sub := net.Pipe()
+		defer sub.Close()
+		observed := &observedWriteConn{Conn: serverConn, writeGate: make(chan struct{}, 1)}
+		connections <- observed
+		setDeadline(t, sub)
+		_, err := sub.Write(encodeConnectPacket(t, connectOptions{clientID: "persistent-sub"}))
+		require.NoError(t, err)
+		synctest.Wait()
+
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("during connect"), QoS: 1, PacketID: 7})
+		_ = decodeClientPacket(t, pub)
+		synctest.Wait()
+		assert.False(t, observed.concurrent.Load())
+		assert.True(t, readConnAck(t, sub))
+		<-replayStarted
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("during replay"), QoS: 1, PacketID: 8})
+		_ = decodeClientPacket(t, pub)
+		unblockReplay()
+
+		for i, payload := range []string{"first", "second"} {
+			packet := decodeClientPacket(t, sub)
+			replayed, ok := packet.(*protocol.PublishPacket)
+			require.True(t, ok)
+			assert.Equal(t, payload, string(replayed.Payload))
+			assert.Equal(t, uint16(i+1), replayed.PacketID)
+			assert.True(t, replayed.DUP)
+		}
+		_, err = sub.Write([]byte{0xC0, 0x00})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, sub))
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("live"), QoS: 1, PacketID: 9})
+		_ = decodeClientPacket(t, pub)
+		packet := decodeClientPacket(t, sub)
+		live, ok := packet.(*protocol.PublishPacket)
+		require.True(t, ok)
+		assert.Equal(t, []byte("live"), live.Payload)
+		assert.False(t, live.DUP)
+	})
+}
+
+func TestStart_ShouldCloseConnection_WhenResponseQueueIsFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t)
+		defer stop()
+		sub, _ := connectPipeClient(t, connections, "slow-sub")
+		defer sub.Close()
+		subscribe(t, sub, 1, "sensors/#", 0, []byte{0})
+		pub, _ := connectPipeClient(t, connections, "publisher")
+		defer pub.Close()
+		// One delivery blocks the writer; the next 1024 fill the bounded queue.
+		for i := range 1025 {
+			writePublish(t, pub, &protocol.PublishPacket{
+				Topic: "sensors/temp", Payload: []byte("queued"), QoS: 1, PacketID: uint16(i + 1),
+			})
+			_ = decodeClientPacket(t, pub)
+			if i == 0 {
+				synctest.Wait()
+			}
+		}
+		_, err := sub.Write([]byte{0xC0, 0x00})
+		require.NoError(t, err)
+		synctest.Wait()
+		_, err = sub.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+		_, err = pub.Write([]byte{0xC0, 0x00})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, pub))
+	})
+}
+
+func TestStart_ShouldPreservePendingMessages_WhenReplayQueueIsFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv, connections, stop := startPipeTestServer(t)
+		defer stop()
+		state, _ := srv.sessions.GetOrCreate("persistent-sub")
+		for range 1026 {
+			_, err := state.TrackOutbound(&protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("pending"), QoS: 1})
+			require.NoError(t, err)
+		}
+		serverConn, conn := net.Pipe()
+		defer conn.Close()
+		connections <- serverConn
+		setDeadline(t, conn)
+		_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: "persistent-sub"}))
+		require.NoError(t, err)
+		assert.True(t, readConnAck(t, conn))
+		synctest.Wait()
+		_, err = conn.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+		assert.Len(t, state.ReplayPending(), 1026)
+	})
+}
 
 func TestStart_ShouldProcessPacketsInOrder_WhenStreamIsConcatenatedOrFragmented(t *testing.T) {
 	testCases := []struct {
@@ -673,6 +845,63 @@ func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T
 	err := srv.Start(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 2, acceptCalls)
+}
+
+// Pipe connections make blocked writes and concurrent handlers deterministic in synctest.
+func startPipeTestServer(t *testing.T, opts ...Option) (*Server, chan<- net.Conn, func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	connections := make(chan net.Conn)
+	listener := &stubListener{
+		acceptFn: func() (net.Conn, error) {
+			select {
+			case conn := <-connections:
+				return conn, nil
+			case <-ctx.Done():
+				return nil, net.ErrClosed
+			}
+		},
+		closeFn: func() error { return nil },
+		addrFn:  func() net.Addr { return stubAddr("pipe") },
+	}
+	allOpts := append([]Option{WithListener(func(string, string) (net.Listener, error) { return listener, nil })}, opts...)
+	srv := newTestServer(allOpts...)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx) }()
+	return srv, connections, func() {
+		cancel()
+		require.NoError(t, <-errCh)
+	}
+}
+
+func connectPipeClient(t *testing.T, connections chan<- net.Conn, id string) (net.Conn, *observedWriteConn) {
+	t.Helper()
+	serverConn, conn := net.Pipe()
+	observed := &observedWriteConn{Conn: serverConn, writeGate: make(chan struct{}, 1)}
+	connections <- observed
+	setDeadline(t, conn)
+	_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: id, cleanSession: true}))
+	require.NoError(t, err)
+	readConnAck(t, conn)
+	return conn, observed
+}
+
+type observedWriteConn struct {
+	net.Conn
+	writing    atomic.Int32
+	concurrent atomic.Bool
+	writeGate  chan struct{}
+}
+
+func (c *observedWriteConn) Write(p []byte) (int, error) {
+	if c.writing.Add(1) > 1 {
+		c.concurrent.Store(true)
+	}
+	defer c.writing.Add(-1)
+	// A channel gate keeps competing writes durably blocked for synctest.Wait.
+	c.writeGate <- struct{}{}
+	defer func() { <-c.writeGate }()
+	return c.Conn.Write(p)
 }
 
 type stubListener struct {

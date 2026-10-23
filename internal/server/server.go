@@ -106,13 +106,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	sess, sessionPresent := s.openSession(connect, cli)
+	sess, sessionPresent := s.openSession(connect)
 	defer s.closeSession(connect, cli)
 
 	log.Printf("client connected: %s (cleanSession=%v, sessionPresent=%v)",
 		cli.ID(), connect.CleanSession, sessionPresent)
 
-	if err := protocol.Encode(conn, &protocol.ConnAckPacket{
+	if err := sendPacket(cli, &protocol.ConnAckPacket{
 		SessionPresent: sessionPresent,
 		ReturnCode:     protocol.ConnAckAccepted,
 	}); err != nil {
@@ -123,6 +123,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	if err := s.replayInflight(cli, sess); err != nil {
 		log.Printf("replay inflight error: %v", err)
 		return
+	}
+	// Make live deliveries visible only after CONNACK and replay are queued.
+	for _, sub := range sess.SnapshotSubscriptions() {
+		s.broker.Subscribe(sub.Filter, sub.QoS, cli)
 	}
 
 	cleanDisconnect := false
@@ -154,19 +158,14 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.Conne
 }
 
 // openSession restores a persistent session or creates a clean one.
-func (s *Server) openSession(connect *protocol.ConnectPacket, cli *client.Client) (*session.State, bool) {
+func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, bool) {
 	if connect.CleanSession {
 		s.sessions.Delete(connect.ClientID)
 		state, _ := s.sessions.GetOrCreate(connect.ClientID)
 		return state, false
 	}
 
-	state, found := s.sessions.GetOrCreate(connect.ClientID)
-	for _, sub := range state.SnapshotSubscriptions() {
-		s.broker.Subscribe(sub.Filter, sub.QoS, cli)
-	}
-
-	return state, found
+	return s.sessions.GetOrCreate(connect.ClientID)
 }
 
 // closeSession persists or discards the session and cleans up the client.
@@ -206,7 +205,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, reader *bufio.Reader,
 				return false
 			}
 
-			if err := s.handlePacket(conn, cli, sess, pkt); err != nil {
+			if err := s.handlePacket(cli, sess, pkt); err != nil {
 				if !errors.Is(err, errDisconnect) {
 					log.Printf("packet error: %v", err)
 				}
@@ -217,18 +216,18 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, reader *bufio.Reader,
 }
 
 // handlePacket dispatches a decoded packet to the appropriate handler.
-func (s *Server) handlePacket(conn net.Conn, cli *client.Client, sess *session.State, pkt protocol.Packet) error {
+func (s *Server) handlePacket(cli *client.Client, sess *session.State, pkt protocol.Packet) error {
 	switch p := pkt.(type) {
 	case *protocol.PingReqPacket:
-		return s.handlePing(conn)
+		return s.handlePing(cli)
 	case *protocol.PubAckPacket:
 		return s.handlePubAck(sess, p)
 	case *protocol.SubscribePacket:
-		return s.handleSubscribe(conn, cli, sess, p)
+		return s.handleSubscribe(cli, sess, p)
 	case *protocol.UnsubscribePacket:
-		return s.handleUnsubscribe(conn, cli, sess, p)
+		return s.handleUnsubscribe(cli, sess, p)
 	case *protocol.PublishPacket:
-		return s.handlePublish(conn, p)
+		return s.handlePublish(cli, p)
 	case *protocol.DisconnectPacket:
 		log.Printf("client %s sent DISCONNECT", cli.ID())
 		return errDisconnect
@@ -246,8 +245,16 @@ func (s *Server) publishWill(will *protocol.WillMessage) {
 	})
 }
 
-func (s *Server) handlePing(conn net.Conn) error {
-	return protocol.Encode(conn, &protocol.PingRespPacket{})
+func sendPacket(cli *client.Client, pkt protocol.Packet) error {
+	var buf bytes.Buffer
+	if err := protocol.Encode(&buf, pkt); err != nil {
+		return err
+	}
+	return cli.Send(buf.Bytes())
+}
+
+func (s *Server) handlePing(cli *client.Client) error {
+	return sendPacket(cli, &protocol.PingRespPacket{})
 }
 
 func (s *Server) handlePubAck(sess *session.State, p *protocol.PubAckPacket) error {
@@ -255,7 +262,7 @@ func (s *Server) handlePubAck(sess *session.State, p *protocol.PubAckPacket) err
 	return nil
 }
 
-func (s *Server) handleSubscribe(conn net.Conn, cli *client.Client, sess *session.State, p *protocol.SubscribePacket) error {
+func (s *Server) handleSubscribe(cli *client.Client, sess *session.State, p *protocol.SubscribePacket) error {
 	returnCodes := make([]byte, len(p.Subscriptions))
 
 	for i, sub := range p.Subscriptions {
@@ -273,28 +280,28 @@ func (s *Server) handleSubscribe(conn net.Conn, cli *client.Client, sess *sessio
 		}
 	}
 
-	return protocol.Encode(conn, &protocol.SubAckPacket{
+	return sendPacket(cli, &protocol.SubAckPacket{
 		PacketID:    p.PacketID,
 		ReturnCodes: returnCodes,
 	})
 }
 
-func (s *Server) handleUnsubscribe(conn net.Conn, cli *client.Client, sess *session.State, p *protocol.UnsubscribePacket) error {
+func (s *Server) handleUnsubscribe(cli *client.Client, sess *session.State, p *protocol.UnsubscribePacket) error {
 	for _, filter := range p.Topics {
 		s.broker.Unsubscribe(filter, cli.ID())
 		sess.DeleteSubscription(filter)
 	}
 
-	return protocol.Encode(conn, &protocol.UnsubAckPacket{PacketID: p.PacketID})
+	return sendPacket(cli, &protocol.UnsubAckPacket{PacketID: p.PacketID})
 }
 
-func (s *Server) handlePublish(conn net.Conn, p *protocol.PublishPacket) error {
+func (s *Server) handlePublish(cli *client.Client, p *protocol.PublishPacket) error {
 	if err := s.publishMessage(p); err != nil {
 		return err
 	}
 
 	if p.QoS == 1 {
-		return protocol.Encode(conn, &protocol.PubAckPacket{PacketID: p.PacketID})
+		return sendPacket(cli, &protocol.PubAckPacket{PacketID: p.PacketID})
 	}
 
 	return nil

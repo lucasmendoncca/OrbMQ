@@ -85,6 +85,11 @@ Some notable implementation choices in the current broker:
   - topic updates clone and swap the trie, keeping publish reads lock-free
 - **Per-client send queue**
   - each client has a buffered queue and dedicated write loop
+  - control responses and publications share the same FIFO queue; only the write loop writes to the connection
+  - control responses wait for their write to finish, preserving responses before a subsequent DISCONNECT
+  - reconnects write CONNACK first, enqueue pending QoS 1 replay, then reactivate subscriptions for live delivery
+  - retained messages for a subscription are queued before its SUBACK
+  - a full queue rejects new packets immediately; the server closes the affected connection for control or replay failures, and evicts slow subscribers during fan-out
 - **Subscriber abstraction**
   - the broker depends on an interface instead of a concrete client type
 - **Allocation-aware publish path**

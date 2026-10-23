@@ -2,8 +2,10 @@ package client
 
 import (
 	"errors"
+	"io"
 	"log"
 	"net"
+	"sync"
 )
 
 var ErrClientQueueFull = errors.New("client queue is full")
@@ -12,15 +14,21 @@ type Client struct {
 	id   string
 	conn net.Conn
 
-	sendQ chan []byte
-	done  chan struct{}
+	sendQ     chan queuedWrite
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+type queuedWrite struct {
+	data   []byte
+	result chan error
 }
 
 func New(id string, conn net.Conn) *Client {
 	c := &Client{
 		id:    id,
 		conn:  conn,
-		sendQ: make(chan []byte, 1024),
+		sendQ: make(chan queuedWrite, 1024),
 		done:  make(chan struct{}),
 	}
 
@@ -39,8 +47,39 @@ func (c *Client) ID() string {
 // This is intended to provide backpressure to the caller if the
 // client is unable to process messages quickly enough.
 func (c *Client) Enqueue(data []byte) error {
+	return c.enqueue(queuedWrite{data: data})
+}
+
+// Send queues a complete packet and waits for its write to finish. Like Enqueue,
+// it returns ErrClientQueueFull immediately if there is no space in the queue.
+func (c *Client) Send(data []byte) error {
+	result := make(chan error, 1)
+	if err := c.enqueue(queuedWrite{data: data, result: result}); err != nil {
+		return err
+	}
 	select {
-	case c.sendQ <- data:
+	case err := <-result:
+		return err
+	case <-c.done:
+		select {
+		case err := <-result:
+			return err
+		default:
+			return net.ErrClosed
+		}
+	}
+}
+
+func (c *Client) enqueue(write queuedWrite) error {
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	case c.sendQ <- write:
 		return nil
 	default:
 		// queue is full - backpressure
@@ -51,13 +90,10 @@ func (c *Client) Enqueue(data []byte) error {
 // Close closes the client's underlying connection and marks it as done.
 // It is safe to call Close from multiple goroutines.
 func (c *Client) Close() {
-	select {
-	case <-c.done:
-		return
-	default:
+	c.closeOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
-	}
+	})
 }
 
 // writeLoop is a goroutine that writes data from the client's sendQ channel
@@ -67,8 +103,15 @@ func (c *Client) Close() {
 func (c *Client) writeLoop() {
 	for {
 		select {
-		case data := <-c.sendQ:
-			if _, err := c.conn.Write(data); err != nil {
+		case write := <-c.sendQ:
+			n, err := c.conn.Write(write.data)
+			if err == nil && n != len(write.data) {
+				err = io.ErrShortWrite
+			}
+			if write.result != nil {
+				write.result <- err
+			}
+			if err != nil {
 				log.Printf("client %s write error: %v", c.id, err)
 				c.Close()
 				return
