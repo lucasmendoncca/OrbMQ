@@ -18,8 +18,13 @@ type connectFlags struct {
 
 // Decode reads a packet from the given io.Reader and returns the corresponding
 // decoded Packet, or an error if the packet is invalid.
+// For a stream of packets, callers must reuse the same *bufio.Reader across calls
+// so that bytes read ahead remain available for the next packet.
 func Decode(r io.Reader) (Packet, error) {
-	br := bufio.NewReader(r)
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+	}
 
 	b1, err := br.ReadByte()
 	if err != nil {

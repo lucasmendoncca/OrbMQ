@@ -1,10 +1,12 @@
 package protocol
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"io"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,6 +34,51 @@ const (
 	unsubscribeHeader   = byte(0xA2)
 	disconnectHeader    = byte(0xE0)
 )
+
+func TestDecode_ShouldPreservePacketOrder_WhenPacketsShareBufferedReader(t *testing.T) {
+	testCases := []struct {
+		name       string
+		bufferSize int
+		fragmented bool
+	}{
+		{name: "default buffer", bufferSize: 4096},
+		{name: "small buffer", bufferSize: 16},
+		{name: "fragmented input", bufferSize: 16, fragmented: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			connect := buildConnectPacket(connectPacketOptions{cleanSession: true, clientID: decoderClientID})
+			pub := &PublishPacket{
+				Topic: decoderTopicName, Payload: bytes.Repeat([]byte("x"), 128), QoS: 1, PacketID: decoderPacketID,
+			}
+			var stream bytes.Buffer
+			stream.Write(connect)
+			require.NoError(t, EncodePublish(&stream, pub))
+			stream.Write([]byte{pingReqHeader, 0, disconnectHeader, 0})
+
+			var input io.Reader = &stream
+			if tc.fragmented {
+				input = iotest.OneByteReader(input)
+			}
+			reader := bufio.NewReaderSize(input, tc.bufferSize)
+
+			pkt, err := Decode(reader)
+			require.NoError(t, err)
+			conn, ok := pkt.(*ConnectPacket)
+			require.True(t, ok)
+			assert.Equal(t, decoderClientID, conn.ClientID)
+
+			for _, expected := range []Packet{pub, &PingReqPacket{}, &DisconnectPacket{}} {
+				pkt, err = Decode(reader)
+				require.NoError(t, err)
+				assert.Equal(t, expected, pkt)
+			}
+			_, err = Decode(reader)
+			require.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
 
 func TestDecode_ShouldDecodeConnectPacket_WhenPacketIsValid(t *testing.T) {
 	input := buildConnectPacket(connectPacketOptions{

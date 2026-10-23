@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -99,7 +100,8 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	connect, cli, err := s.handshake(conn)
+	reader := bufio.NewReader(conn)
+	connect, cli, err := s.handshake(conn, reader)
 	if err != nil {
 		return
 	}
@@ -130,13 +132,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 	}()
 
-	cleanDisconnect = s.serve(ctx, conn, cli, sess, connect.KeepAlive)
+	cleanDisconnect = s.serve(ctx, conn, reader, cli, sess, connect.KeepAlive)
 }
 
-// handshake reads the first packet from conn, validates it is a CONNECT,
+// handshake reads the first packet from reader, validates it is a CONNECT,
 // and returns the parsed packet and a new Client.
-func (s *Server) handshake(conn net.Conn) (*protocol.ConnectPacket, *client.Client, error) {
-	pkt, err := protocol.Decode(conn)
+func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.ConnectPacket, *client.Client, error) {
+	pkt, err := protocol.Decode(reader)
 	if err != nil {
 		log.Printf("decode error (CONNECT): %v", err)
 		return nil, nil, err
@@ -179,7 +181,7 @@ func (s *Server) closeSession(connect *protocol.ConnectPacket, cli *client.Clien
 
 // serve runs the main packet loop. Returns true if the client disconnected
 // cleanly (sent DISCONNECT), false on error or timeout.
-func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, sess *session.State, keepAlive uint16) bool {
+func (s *Server) serve(ctx context.Context, conn net.Conn, reader *bufio.Reader, cli *client.Client, sess *session.State, keepAlive uint16) bool {
 	var timeout time.Duration
 	if keepAlive > 0 {
 		timeout = time.Duration(float64(keepAlive)*1.5) * time.Second
@@ -194,7 +196,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, cli *client.Client, s
 				conn.SetReadDeadline(time.Now().Add(timeout))
 			}
 
-			pkt, err := protocol.Decode(conn)
+			pkt, err := protocol.Decode(reader)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("client %s keep-alive timeout", cli.ID())

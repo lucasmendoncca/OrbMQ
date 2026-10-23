@@ -18,6 +18,67 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStart_ShouldProcessPacketsInOrder_WhenStreamIsConcatenatedOrFragmented(t *testing.T) {
+	testCases := []struct {
+		name           string
+		afterHandshake bool
+		fragmented     bool
+	}{
+		{name: "single write including connect"},
+		{name: "single write after handshake", afterHandshake: true},
+		{name: "one byte per write", fragmented: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startTestServer(t)
+			opts := connectOptions{clientID: "stream-client", cleanSession: true}
+			var conn net.Conn
+			var stream bytes.Buffer
+			var responses [][]byte
+			if tc.afterHandshake {
+				conn, _ = connectClient(t, srv, opts)
+			} else {
+				conn = openClientConn(t, srv)
+				stream.Write(encodeConnectPacket(t, opts))
+				responses = append(responses, []byte{0x20, 0x02, 0x00, 0x00})
+			}
+			defer conn.Close()
+
+			require.NoError(t, protocol.EncodePublish(&stream, &protocol.PublishPacket{
+				Topic: "stream/value", Payload: bytes.Repeat([]byte("x"), 128), QoS: 1, PacketID: 7, Retain: true,
+			}))
+			stream.Write([]byte{0xC0, 0x00})
+			require.NoError(t, protocol.EncodePublish(&stream, &protocol.PublishPacket{
+				Topic: "stream/value", Payload: []byte("last"), QoS: 1, PacketID: 9, Retain: true,
+			}))
+			stream.Write([]byte{0xE0, 0x00})
+			responses = append(responses, []byte{0x40, 0x02, 0x00, 0x07}, []byte{0xD0, 0x00}, []byte{0x40, 0x02, 0x00, 0x09})
+
+			setDeadline(t, conn)
+			if tc.fragmented {
+				for _, b := range stream.Bytes() {
+					n, err := conn.Write([]byte{b})
+					require.NoError(t, err)
+					require.Equal(t, 1, n)
+				}
+			} else {
+				n, err := conn.Write(stream.Bytes())
+				require.NoError(t, err)
+				require.Equal(t, stream.Len(), n)
+			}
+
+			for _, expected := range responses {
+				assert.Equal(t, expected, readPacketBytes(t, conn))
+			}
+			retained := srv.srv.broker.RetainedMatching("stream/value")
+			require.Len(t, retained, 1)
+			assert.Equal(t, []byte("last"), retained[0].Payload)
+			assertConnectionEventuallyClosed(t, conn, 2*time.Second)
+		})
+	}
+}
+
 func TestStart_ShouldAcknowledgeQoS1PublishAndDeliverToSubscriber_WhenSubscriberRequestsQoS1(t *testing.T) {
 	srv := startTestServer(t)
 
