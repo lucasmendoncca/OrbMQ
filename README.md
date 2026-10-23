@@ -10,9 +10,13 @@ OrbMQ currently provides a functional MQTT 3.1.1 publish/subscribe flow with:
 
 - topic subscriptions with wildcard support
 - retained message handling
+- QoS 0 and QoS 1 delivery, including PUBACK handling and replay of unacknowledged outbound QoS 1 messages on reconnect
+- in-memory sessions that restore subscriptions and pending QoS 1 messages when reconnecting with the same Client ID and `CleanSession=false`
+- Last Will publication on unexpected disconnects
+- Keep Alive timeout enforcement
 - concurrent fan-out
 - buffered client writes with backpressure handling
-- a modular internal architecture around broker, protocol, topic, server, and client responsibilities
+- a modular internal architecture around broker, protocol, topic, server, client, and session responsibilities
 
 Current packet support:
 
@@ -21,6 +25,7 @@ Current packet support:
 | CONNECT     | Client -> Broker |
 | CONNACK     | Broker -> Client |
 | PUBLISH     | Both             |
+| PUBACK      | Both             |
 | SUBSCRIBE   | Client -> Broker |
 | SUBACK      | Broker -> Client |
 | UNSUBSCRIBE | Client -> Broker |
@@ -32,11 +37,16 @@ Current packet support:
 Not implemented yet as complete broker capabilities:
 
 - MQTT 5 support
-- persistent sessions
-- QoS 1 and QoS 2 flows
-- TLS
+- durable session storage and queueing of new messages for offline subscribers
+- session expiry
+- QoS 2 flows
+- TLS, authentication, and authorization
 - clustering
 - management API and UI
+
+Session state and retained messages are stored only in memory and are lost when the process exits. With `CleanSession=true`, previous session state is discarded and the new session is removed on disconnect. With `CleanSession=false`, subscriptions and unacknowledged outbound QoS 1 messages survive disconnects within the same broker process; pending messages are replayed with `DUP=true` on reconnect. New publications are not queued for offline subscribers.
+
+Subscriptions requesting QoS 2 are granted QoS 1. The QoS 2 publish handshake is not implemented.
 
 ## Project Direction
 
@@ -55,7 +65,7 @@ OrbMQ is structured to keep protocol logic, broker behavior, and connection hand
 
 - `cmd/orbmq/`
   - application entry point
-  - wires broker and server
+  - wires broker, session store, and server
   - handles process lifecycle and shutdown
 - `internal/server/`
   - TCP listener
@@ -73,6 +83,10 @@ OrbMQ is structured to keep protocol logic, broker behavior, and connection hand
   - MQTT packet encoding and decoding
   - strict binary parsing
   - protocol details without business logic
+- `internal/session/`
+  - in-memory session state keyed by Client ID
+  - subscription state and outbound packet identifier allocation
+  - tracking, acknowledgement, and replay of outbound QoS 1 messages
 - `internal/topic/`
   - topic tree and wildcard matching
   - subscriber lookup for publish routing
@@ -107,7 +121,7 @@ These patterns should continue to guide future work, especially when extending t
 
 ### Requirements
 
-- Go 1.21 or newer
+- Go 1.25.0 or newer
 - an MQTT client such as MQTT Explorer or `mosquitto_pub` / `mosquitto_sub`
 
 ### Run the broker
@@ -116,7 +130,23 @@ These patterns should continue to guide future work, especially when extending t
 go run ./cmd/orbmq/main.go
 ```
 
-The broker listens on port `1883` by default.
+The executable listens on `:1883` (all interfaces). The address is set in `cmd/orbmq/main.go`; there are currently no command-line flags or environment variables to configure it. Connections use plain TCP without authentication or authorization; CONNECT credentials are parsed but not validated.
+
+### Publish and subscribe
+
+With the broker running, start a subscriber in another terminal:
+
+```sh
+mosquitto_sub -h localhost -p 1883 -V mqttv311 -t 'demo/#' -q 1 -v
+```
+
+Publish a QoS 1 message from a separate terminal:
+
+```sh
+mosquitto_pub -h localhost -p 1883 -V mqttv311 -t demo/hello -q 1 -m 'Hello OrbMQ'
+```
+
+The subscriber prints `demo/hello Hello OrbMQ`. Add `-r` to the publisher command to retain the message for future matching subscriptions.
 
 ### Run tests
 
@@ -130,12 +160,16 @@ go test ./...
 go test ./internal/protocol/...
 go test ./internal/broker/...
 go test ./internal/topic/...
+go test ./internal/server/...
+go test ./internal/session/...
 ```
 
 ### Run benchmarks
 
+No benchmark functions are currently defined in the repository. Once broker benchmarks are added, run them with allocation reporting:
+
 ```sh
-go test -bench=. ./internal/broker/...
+go test -run='^$' -bench=. -benchmem ./internal/broker/...
 ```
 
 ## Engineering Priorities
@@ -152,8 +186,8 @@ go test -bench=. ./internal/broker/...
 Planned evolution areas include:
 
 - full MQTT 5 protocol support
-- session lifecycle and expiry handling
-- QoS 1 and QoS 2 support
+- durable session storage, offline message queueing, and session expiry
+- QoS 2 support
 - TLS, authentication, and authorization
 - metrics and observability
 - Docker image and containerized deployment
