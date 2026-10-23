@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -386,6 +387,88 @@ func TestStart_ShouldClosePublisherConnectionWithoutPubAck_WhenOutboundEncodingF
 	})
 
 	assertConnectionEventuallyClosed(t, pubConn, 2*time.Second)
+}
+
+func TestStart_ShouldEncodeQoS0PublishOnlyOnce_WhenMultipleSubscribersMatch(t *testing.T) {
+	var encodeCalls atomic.Int32
+
+	srv := startTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+		encodeCalls.Add(1)
+		return encodePublishPacket(pub)
+	}))
+
+	subConnA, _ := connectClient(t, srv, connectOptions{clientID: "encode-once-sub-a", cleanSession: true})
+	defer subConnA.Close()
+	subscribe(t, subConnA, 1, "shared/+", 0, []byte{0})
+
+	subConnB, _ := connectClient(t, srv, connectOptions{clientID: "encode-once-sub-b", cleanSession: true})
+	defer subConnB.Close()
+	subscribe(t, subConnB, 1, "shared/+", 0, []byte{0})
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "encode-once-pub", cleanSession: true})
+	defer pubConn.Close()
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:   "shared/topic",
+		Payload: []byte("value"),
+	})
+
+	deliveredA := decodeClientPacket(t, subConnA)
+	deliveredPubA, ok := deliveredA.(*protocol.PublishPacket)
+	require.True(t, ok)
+	assert.Equal(t, []byte("value"), deliveredPubA.Payload)
+	assert.Equal(t, byte(0), deliveredPubA.QoS)
+
+	deliveredB := decodeClientPacket(t, subConnB)
+	deliveredPubB, ok := deliveredB.(*protocol.PublishPacket)
+	require.True(t, ok)
+	assert.Equal(t, []byte("value"), deliveredPubB.Payload)
+	assert.Equal(t, byte(0), deliveredPubB.QoS)
+
+	assert.Equal(t, int32(1), encodeCalls.Load())
+}
+
+func TestStart_ShouldEncodeQoS1PublishOnlyOnce_WhenMultipleSubscribersMatch(t *testing.T) {
+	var encodeCalls atomic.Int32
+
+	srv := startTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+		encodeCalls.Add(1)
+		return encodePublishPacket(pub)
+	}))
+
+	subConnA, _ := connectClient(t, srv, connectOptions{clientID: "encode-qos1-sub-a", cleanSession: false})
+	defer subConnA.Close()
+	subscribe(t, subConnA, 1, "tracked/+", 1, []byte{1})
+
+	subConnB, _ := connectClient(t, srv, connectOptions{clientID: "encode-qos1-sub-b", cleanSession: false})
+	defer subConnB.Close()
+	subscribe(t, subConnB, 1, "tracked/+", 1, []byte{1})
+
+	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "encode-qos1-pub", cleanSession: true})
+	defer pubConn.Close()
+
+	writePublish(t, pubConn, &protocol.PublishPacket{
+		Topic:    "tracked/topic",
+		Payload:  []byte("value"),
+		QoS:      1,
+		PacketID: 41,
+	})
+
+	_ = decodeClientPacket(t, pubConn)
+
+	deliveredA := decodeClientPacket(t, subConnA)
+	deliveredPubA, ok := deliveredA.(*protocol.PublishPacket)
+	require.True(t, ok)
+	assert.Equal(t, byte(1), deliveredPubA.QoS)
+	assert.NotZero(t, deliveredPubA.PacketID)
+
+	deliveredB := decodeClientPacket(t, subConnB)
+	deliveredPubB, ok := deliveredB.(*protocol.PublishPacket)
+	require.True(t, ok)
+	assert.Equal(t, byte(1), deliveredPubB.QoS)
+	assert.NotZero(t, deliveredPubB.PacketID)
+
+	assert.Equal(t, int32(1), encodeCalls.Load())
 }
 
 func TestStart_ShouldCloseSubscriberConnectionWithoutSubAck_WhenRetainedDeliveryExhaustsPacketIDs(t *testing.T) {

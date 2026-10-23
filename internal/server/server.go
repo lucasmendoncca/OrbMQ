@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
@@ -26,6 +27,22 @@ type Server struct {
 	sessions        *session.Store
 	listenFn        func(network, addr string) (net.Listener, error)
 	encodePublishFn func(pub *protocol.PublishPacket) ([]byte, error)
+}
+
+type publishTemplate struct {
+	raw            []byte
+	packetIDOffset int
+}
+
+type publishDeliveryCache struct {
+	qos0 []byte
+	qos1 *publishTemplate
+}
+
+var publishEncodeBufferPool = sync.Pool{
+	New: func() any {
+		return &bytes.Buffer{}
+	},
 }
 
 func New(addr string, b *broker.Broker, sessions *session.Store, opts ...Option) *Server {
@@ -282,32 +299,15 @@ func (s *Server) handlePublish(conn net.Conn, p *protocol.PublishPacket) error {
 }
 
 func (s *Server) publishMessage(p *protocol.PublishPacket) error {
+	cache := &publishDeliveryCache{}
 	var publishErr error
 
 	s.broker.Publish(p, func(sub topic.Subscription) error {
-		state, ok := s.sessions.Get(sub.ClientID)
-		if !ok {
-			return nil
-		}
-
-		deliveryQoS := p.QoS
-		if sub.QoS < deliveryQoS {
-			deliveryQoS = sub.QoS
-		}
-
-		outbound := &protocol.PublishPacket{
-			Topic:   p.Topic,
-			Payload: p.Payload,
-			Retain:  p.Retain,
-			QoS:     deliveryQoS,
-		}
-
-		if err := s.enqueuePublish(sub.Subscriber, state, outbound); err != nil {
+		err := s.deliverPublishToSubscriber(p, sub, cache)
+		if err != nil {
 			publishErr = err
-			return err
 		}
-
-		return nil
+		return err
 	})
 
 	return publishErr
@@ -327,7 +327,7 @@ func (s *Server) sendRetained(cli *client.Client, sess *session.State, filter st
 			QoS:     deliveryQoS,
 		}
 
-		if err := s.enqueuePublish(cli, sess, outbound); err != nil {
+		if err := s.enqueuePublish(cli, sess, outbound, nil); err != nil {
 			return err
 		}
 	}
@@ -349,7 +349,32 @@ func (s *Server) replayInflight(cli *client.Client, sess *session.State) error {
 	return nil
 }
 
-func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *protocol.PublishPacket) error {
+func (s *Server) deliverPublishToSubscriber(pub *protocol.PublishPacket, sub topic.Subscription, cache *publishDeliveryCache) error {
+	state, ok := s.sessions.Get(sub.ClientID)
+	if !ok {
+		return nil
+	}
+
+	deliveryQoS := deliveryQoS(pub.QoS, sub.QoS)
+	outbound := newOutboundPublish(pub, deliveryQoS)
+
+	if deliveryQoS == 0 {
+		raw, err := cache.qos0Payload(s.encodePublishFn, outbound)
+		if err != nil {
+			return err
+		}
+		return sub.Subscriber.Enqueue(raw)
+	}
+
+	template, err := cache.qos1Template(s.encodePublishFn, outbound)
+	if err != nil {
+		return err
+	}
+
+	return s.enqueuePublish(sub.Subscriber, state, outbound, template)
+}
+
+func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *protocol.PublishPacket, template *publishTemplate) error {
 	rawPub := pub
 	if pub.QoS == 1 {
 		tracked, err := sess.TrackOutbound(pub)
@@ -359,12 +384,18 @@ func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *
 		rawPub = tracked
 	}
 
-	raw, err := s.encodePublishFn(rawPub)
-	if err != nil {
-		if rawPub.QoS == 1 {
-			sess.Ack(rawPub.PacketID)
+	var raw []byte
+	if template != nil {
+		raw = template.withPacketID(rawPub.PacketID)
+	} else {
+		var err error
+		raw, err = s.encodePublishFn(rawPub)
+		if err != nil {
+			if rawPub.QoS == 1 {
+				sess.Ack(rawPub.PacketID)
+			}
+			return err
 		}
-		return err
 	}
 
 	if err := sub.Enqueue(raw); err != nil {
@@ -377,10 +408,104 @@ func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *
 	return nil
 }
 
+func deliveryQoS(publishQoS byte, subscriptionQoS byte) byte {
+	if subscriptionQoS < publishQoS {
+		return subscriptionQoS
+	}
+
+	return publishQoS
+}
+
+func newOutboundPublish(pub *protocol.PublishPacket, qos byte) *protocol.PublishPacket {
+	return &protocol.PublishPacket{
+		Topic:   pub.Topic,
+		Payload: pub.Payload,
+		Retain:  pub.Retain,
+		QoS:     qos,
+	}
+}
+
 func encodePublishPacket(pub *protocol.PublishPacket) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := protocol.EncodePublish(&buf, pub); err != nil {
+	buf := publishEncodeBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer publishEncodeBufferPool.Put(buf)
+
+	if err := protocol.EncodePublish(buf, pub); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
+func newPublishTemplate(encodeFn func(pub *protocol.PublishPacket) ([]byte, error), pub *protocol.PublishPacket) (*publishTemplate, error) {
+	if pub.QoS != 1 {
+		return nil, errors.New("publish template requires QoS 1")
+	}
+
+	raw, err := encodeFn(&protocol.PublishPacket{
+		Topic:    pub.Topic,
+		Payload:  pub.Payload,
+		Retain:   pub.Retain,
+		QoS:      pub.QoS,
+		PacketID: 1,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &publishTemplate{
+		raw:            raw,
+		packetIDOffset: publishPacketIDOffset(pub.Topic, len(pub.Payload)),
+	}, nil
+}
+
+func (t *publishTemplate) withPacketID(packetID uint16) []byte {
+	raw := append([]byte(nil), t.raw...)
+	raw[t.packetIDOffset] = byte(packetID >> 8)
+	raw[t.packetIDOffset+1] = byte(packetID)
+	return raw
+}
+
+func (c *publishDeliveryCache) qos0Payload(encodeFn func(pub *protocol.PublishPacket) ([]byte, error), pub *protocol.PublishPacket) ([]byte, error) {
+	if c.qos0 != nil {
+		return c.qos0, nil
+	}
+
+	raw, err := encodeFn(pub)
+	if err != nil {
+		return nil, err
+	}
+
+	c.qos0 = raw
+	return c.qos0, nil
+}
+
+func (c *publishDeliveryCache) qos1Template(encodeFn func(pub *protocol.PublishPacket) ([]byte, error), pub *protocol.PublishPacket) (*publishTemplate, error) {
+	if c.qos1 != nil {
+		return c.qos1, nil
+	}
+
+	template, err := newPublishTemplate(encodeFn, pub)
+	if err != nil {
+		return nil, err
+	}
+
+	c.qos1 = template
+	return c.qos1, nil
+}
+
+func publishPacketIDOffset(topic string, payloadLen int) int {
+	remainingLength := 2 + len(topic) + 2 + payloadLen
+	return 1 + encodedLengthSize(remainingLength) + 2 + len(topic)
+}
+
+func encodedLengthSize(length int) int {
+	size := 0
+	for {
+		size++
+		length /= 128
+		if length == 0 {
+			return size
+		}
+	}
 }
