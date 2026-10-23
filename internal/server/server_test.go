@@ -387,7 +387,7 @@ func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.
 	err := srv.Start(ctx)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		return conn.writeCalls >= 1
+		return conn.writeCalls.Load() >= 1
 	}, time.Second, 10*time.Millisecond)
 }
 
@@ -703,7 +703,7 @@ type scriptConn struct {
 	readErr        error
 	writes         bytes.Buffer
 	writeErr       error
-	writeCalls     int
+	writeCalls     atomic.Int32
 	deadlineWasSet bool
 	readIndex      int
 }
@@ -722,7 +722,7 @@ func (c *scriptConn) Read(p []byte) (int, error) {
 }
 
 func (c *scriptConn) Write(p []byte) (int, error) {
-	c.writeCalls++
+	c.writeCalls.Add(1)
 	if c.writeErr != nil {
 		return 0, c.writeErr
 	}
