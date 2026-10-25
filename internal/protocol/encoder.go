@@ -12,6 +12,9 @@ var ErrUnsupportedPacket = errors.New("unsupported packet type")
 // encodeRemainingLength writes the MQTT variable-length remaining length field.
 // It encodes values from 0 up to 268,435,455 using 1-4 bytes.
 func encodeRemainingLength(w io.Writer, length int) error {
+	if length < 0 || length > MaxRemainingLength {
+		return errors.New("invalid remaining length")
+	}
 	for {
 		encodedByte := length % 128
 		length /= 128
@@ -57,11 +60,18 @@ func EncodePublish(w io.Writer, pkt *PublishPacket) error {
 	if pkt.QoS == 0 && pkt.DUP {
 		return errors.New("invalid DUP flag for QoS 0")
 	}
+	if err := validateTopicName(pkt.Topic); err != nil {
+		return err
+	}
 
-	remainingLength := 2 + len(pkt.Topic) + len(pkt.Payload)
+	remainingLength := 2 + len(pkt.Topic)
 	if pkt.QoS > 0 {
 		remainingLength += 2
 	}
+	if len(pkt.Payload) > MaxRemainingLength-remainingLength {
+		return errors.New("invalid remaining length")
+	}
+	remainingLength += len(pkt.Payload)
 
 	flags := byte(0x30)
 	if pkt.DUP {
@@ -165,6 +175,9 @@ func encodeUnsubAck(w io.Writer, pkt *UnsubAckPacket) error {
 // The function is intended for use by the OrbMQ server only.
 // It is not intended for use by clients.
 func encodeSubAck(w io.Writer, pkt *SubAckPacket) error {
+	if len(pkt.ReturnCodes) > MaxRemainingLength-2 {
+		return errors.New("invalid remaining length")
+	}
 	remainingLength := 2 + len(pkt.ReturnCodes)
 
 	if _, err := w.Write([]byte{0x90}); err != nil {

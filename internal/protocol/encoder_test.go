@@ -3,11 +3,35 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestEncodePublish_ShouldRejectInvalidTopics_WhenPacketIsEncoded(t *testing.T) {
+	for _, topic := range []string{"", "a/+", "a/#", "a\x00", "\xff", strings.Repeat("a", 65536)} {
+		var output bytes.Buffer
+		require.Error(t, EncodePublish(&output, &PublishPacket{Topic: topic}))
+		assert.Empty(t, output.Bytes(), "validation must precede writes")
+	}
+	for _, topic := range []string{"/", "温度", "\ufefftopic", strings.Repeat("a", 65535)} {
+		require.NoError(t, EncodePublish(io.Discard, &PublishPacket{Topic: topic}))
+	}
+}
+
+func TestEncodeRemainingLength_ShouldEnforceProtocolRange_WhenLengthIsAtBoundary(t *testing.T) {
+	for _, length := range []int{-1, 268435456} {
+		var output bytes.Buffer
+		require.Error(t, encodeRemainingLength(&output, length))
+		assert.Empty(t, output.Bytes())
+	}
+	var output bytes.Buffer
+	require.NoError(t, encodeRemainingLength(&output, 268435455))
+	assert.Equal(t, []byte{0xff, 0xff, 0xff, 0x7f}, output.Bytes())
+}
 
 const (
 	testTopic         = "topic"

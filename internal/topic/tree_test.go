@@ -7,6 +7,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestTreeMatch_ShouldRespectTopicLevels_WhenWildcardsAreUsed(t *testing.T) {
+	for _, tc := range []struct {
+		filter, topic string
+		match         bool
+	}{
+		{"a/#", "a", true}, {"a/#", "a/", true},
+		{"a/+", "a", false}, {"a/+", "a/", true},
+		{"a", "a/", false}, {"a/", "a", false},
+		{"#", "$SYS/status", false}, {"+/status", "$SYS/status", false},
+		{"$SYS/#", "$SYS", true}, {"$SYS/+", "$SYS/status", true},
+		{"a/+", "a/$status", true}, {"#", "/$SYS", true},
+	} {
+		t.Run(tc.filter+":"+tc.topic, func(t *testing.T) {
+			tree := NewTree()
+			tree.Subscribe(tc.filter, Subscription{ClientID: "client", Subscriber: &stubSubscriber{id: "client"}})
+			matches := tree.Match(tc.topic)
+			defer PutSubs(matches)
+			assert.Equal(t, tc.match, len(matches) == 1)
+		})
+	}
+}
+
 type stubSubscriber struct {
 	id string
 }

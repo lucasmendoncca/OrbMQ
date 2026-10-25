@@ -8,17 +8,21 @@ package topic
 // the topic strings "foo/bar/baz", "foo/bar/foo", etc. If the filter string
 // does not contain any wildcards, it must match the topic string exactly.
 func MatchFilter(filter, topic string) bool {
+	if len(topic) > 0 && topic[0] == '$' && len(filter) > 0 && (filter[0] == '+' || filter[0] == '#') {
+		return false
+	}
 	fLevels := splitFilter(filter)
 	tLevels := splitTopic(topic)
 
 	for i := range fLevels {
+		if fLevels[i] == "#" {
+			return true
+		}
 		if i >= len(tLevels) {
 			return false
 		}
 
 		switch fLevels[i] {
-		case "#":
-			return true
 		case "+":
 			continue
 		default:

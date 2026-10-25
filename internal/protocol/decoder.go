@@ -16,11 +16,23 @@ type connectFlags struct {
 	passwordFlag bool
 }
 
+var ErrPacketTooLarge = errors.New("packet exceeds maximum size")
+
 // Decode reads a packet from the given io.Reader and returns the corresponding
 // decoded Packet, or an error if the packet is invalid.
 // For a stream of packets, callers must reuse the same *bufio.Reader across calls
 // so that bytes read ahead remain available for the next packet.
 func Decode(r io.Reader) (Packet, error) {
+	return DecodeWithLimit(r, MaxPacketSize)
+}
+
+// DecodeWithLimit rejects packets larger than maxPacketSize, including their
+// fixed header, before parsing or allocating the body. The limit must be between
+// 1 and MaxPacketSize. Stream callers must reuse the same buffered reader.
+func DecodeWithLimit(r io.Reader, maxPacketSize int) (Packet, error) {
+	if maxPacketSize <= 0 || maxPacketSize > MaxPacketSize {
+		return nil, errors.New("invalid maximum packet size")
+	}
 	br, ok := r.(*bufio.Reader)
 	if !ok {
 		br = bufio.NewReader(r)
@@ -34,9 +46,12 @@ func Decode(r io.Reader) (Packet, error) {
 	packetType := PacketType(b1 >> 4)
 	flags := b1 & 0x0F
 
-	remainingLength, err := decodeRemainingLength(br)
+	remainingLength, lengthBytes, err := decodeRemainingLength(br)
 	if err != nil {
 		return nil, err
+	}
+	if 1+lengthBytes+remainingLength > maxPacketSize {
+		return nil, ErrPacketTooLarge
 	}
 
 	switch packetType {
@@ -123,6 +138,9 @@ func decodeWill(r io.Reader, qos byte, retain bool) (*WillMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateTopicName(topic); err != nil {
+		return nil, err
+	}
 
 	payload, err := readBinaryData(r)
 	if err != nil {
@@ -192,10 +210,11 @@ func decodeConnect(r io.Reader, remainingLength int) (*ConnectPacket, error) {
 
 	var password *string
 	if flags.passwordFlag {
-		p, err := readUTF8String(lr)
+		data, err := readBinaryData(lr)
 		if err != nil {
 			return nil, err
 		}
+		p := string(data)
 		password = &p
 	}
 
@@ -237,6 +256,9 @@ func decodeSubscribe(r io.Reader, remainingLength int) (*SubscribePacket, error)
 		if err != nil {
 			return nil, err
 		}
+		if err := validateTopicFilter(topic); err != nil {
+			return nil, err
+		}
 
 		var qos [1]byte
 		if _, err := io.ReadFull(lr, qos[:]); err != nil {
@@ -271,6 +293,9 @@ func decodePublish(r io.Reader, remainingLength int, qos byte, dup bool, retain 
 
 	topic, err := readUTF8String(lr)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateTopicName(topic); err != nil {
 		return nil, err
 	}
 
@@ -337,6 +362,9 @@ func decodeUnsubscribe(r io.Reader, remainingLength int) (*UnsubscribePacket, er
 		if err != nil {
 			return nil, err
 		}
+		if err := validateTopicFilter(topic); err != nil {
+			return nil, err
+		}
 		topics = append(topics, topic)
 	}
 
@@ -354,25 +382,25 @@ func decodeUnsubscribe(r io.Reader, remainingLength int) (*UnsubscribePacket, er
 // It returns the decoded integer and an error if the packet is invalid.
 // The function will return an error if the packet is malformed, or if
 // the end of the packet is reached before the integer is complete.
-func decodeRemainingLength(r io.Reader) (int, error) {
+func decodeRemainingLength(r io.Reader) (int, int, error) {
 	multiplier := 1
 	value := 0
 
-	for range 4 {
+	for i := range 4 {
 		var encodedByte [1]byte
-		if _, err := r.Read(encodedByte[:]); err != nil {
-			return 0, err
+		if _, err := io.ReadFull(r, encodedByte[:]); err != nil {
+			return 0, 0, err
 		}
 
 		digit := int(encodedByte[0])
 		value += (digit & 127) * multiplier
 
 		if digit&128 == 0 {
-			return value, nil
+			return value, i + 1, nil
 		}
 
 		multiplier *= 128
 	}
 
-	return 0, io.ErrUnexpectedEOF
+	return 0, 0, io.ErrUnexpectedEOF
 }

@@ -93,6 +93,22 @@ OrbMQ is structured to keep protocol logic, broker behavior, and connection hand
 
 ## Design Characteristics
 
+Incoming packets are limited to 1 MiB by default, including the fixed header.
+Set `server.WithMaxPacketSize(bytes)` when constructing the server to change this
+limit (from 1 byte through `protocol.MaxPacketSize`, 268,435,460 bytes). Oversized
+packets close the connection as soon as the header is decoded, before allocating
+the body. The limit applies to CONNECT and all subsequent incoming packets; it
+does not impose an outbound delivery limit. `protocol.Decode` retains the MQTT
+protocol maximum; callers can use `protocol.DecodeWithLimit` for a smaller limit.
+
+MQTT text fields require well-formed UTF-8 and reject U+0000. Topic names must be
+nonempty and cannot contain wildcards. Filters require `+` to occupy a complete
+level and `#` to occupy the final complete level. Empty levels remain valid;
+topics are not normalized, and binary passwords and payloads are preserved.
+Filters beginning with `+` or `#` do not match topics beginning with `$`; use an
+explicit filter such as `$SYS/#` for those topics. These rules follow the
+[MQTT 3.1.1 specification](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html).
+
 Some notable implementation choices in the current broker:
 
 - **Copy-on-write topic tree**

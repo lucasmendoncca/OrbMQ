@@ -30,6 +30,7 @@ type Server struct {
 	listenFn         func(network, addr string) (net.Listener, error)
 	encodePublishFn  func(pub *protocol.PublishPacket) ([]byte, error)
 	handshakeTimeout time.Duration
+	maxPacketSize    int
 	clientsMu        sync.RWMutex
 	clients          map[string]*activeConnection
 }
@@ -72,6 +73,7 @@ func New(addr string, b *broker.Broker, sessions *session.Store, opts ...Option)
 		listenFn:         net.Listen,
 		encodePublishFn:  encodePublishPacket,
 		handshakeTimeout: 10 * time.Second,
+		maxPacketSize:    1 << 20,
 		clients:          make(map[string]*activeConnection),
 	}
 
@@ -100,7 +102,16 @@ func WithHandshakeTimeout(timeout time.Duration) Option {
 	return func(s *Server) { s.handshakeTimeout = timeout }
 }
 
+// WithMaxPacketSize limits inbound packets, including the fixed header.
+// The default is 1 MiB; the limit must be between 1 and protocol.MaxPacketSize.
+func WithMaxPacketSize(size int) Option {
+	return func(s *Server) { s.maxPacketSize = size }
+}
+
 func (s *Server) Start(ctx context.Context) error {
+	if s.maxPacketSize <= 0 || s.maxPacketSize > protocol.MaxPacketSize {
+		return errors.New("invalid maximum packet size")
+	}
 	if s.handshakeTimeout <= 0 {
 		return errors.New("handshake timeout must be positive")
 	}
@@ -253,7 +264,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 // handshake reads the first packet from reader, validates it is a CONNECT,
 // and returns the parsed packet and a new Client.
 func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.ConnectPacket, *client.Client, error) {
-	pkt, err := protocol.Decode(reader)
+	pkt, err := protocol.DecodeWithLimit(reader, s.maxPacketSize)
 	if err != nil {
 		log.Printf("decode error (CONNECT): %v", err)
 		return nil, nil, err
@@ -339,7 +350,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn, reader *bufio.Reader,
 				conn.SetReadDeadline(time.Now().Add(timeout))
 			}
 
-			pkt, err := protocol.Decode(reader)
+			pkt, err := protocol.DecodeWithLimit(reader, s.maxPacketSize)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("client %s keep-alive timeout", cli.ID())

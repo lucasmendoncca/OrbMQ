@@ -2,7 +2,16 @@ package protocol
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
+	"strings"
+	"unicode/utf8"
+)
+
+const (
+	MaxRemainingLength = 268435455
+	// MaxPacketSize includes the fixed header and the four-byte remaining length.
+	MaxPacketSize = MaxRemainingLength + 5
 )
 
 // readBinaryData reads a length-prefixed binary field from the given io.Reader.
@@ -36,5 +45,48 @@ func readUTF8String(r io.Reader) (string, error) {
 		return "", err
 	}
 
-	return string(buf), nil
+	value := string(buf)
+	if err := validateUTF8String(value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func validateUTF8String(value string) error {
+	if len(value) > 65535 || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
+		return errors.New("invalid mqtt utf-8 string")
+	}
+	return nil
+}
+
+func validateTopicName(value string) error {
+	if err := validateUTF8String(value); err != nil {
+		return err
+	}
+	if value == "" || strings.ContainsAny(value, "+#") {
+		return errors.New("invalid topic name")
+	}
+	return nil
+}
+
+func validateTopicFilter(value string) error {
+	if err := validateUTF8String(value); err != nil {
+		return err
+	}
+	if value == "" {
+		return errors.New("invalid topic filter")
+	}
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '+':
+			if (i > 0 && value[i-1] != '/') || (i+1 < len(value) && value[i+1] != '/') {
+				return errors.New("invalid topic filter")
+			}
+		case '#':
+			if (i > 0 && value[i-1] != '/') || i != len(value)-1 {
+				return errors.New("invalid topic filter")
+			}
+		}
+	}
+	return nil
 }

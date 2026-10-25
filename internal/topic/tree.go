@@ -120,7 +120,7 @@ func (t *Tree) match(n *node, topic string, idx int, out map[string]Subscription
 		return
 	}
 
-	if idx >= len(topic) {
+	if idx > len(topic) {
 		for _, sub := range n.subs {
 			t.addMatch(out, sub)
 		}
@@ -139,14 +139,13 @@ func (t *Tree) match(n *node, topic string, idx int, out map[string]Subscription
 
 	level := topic[idx:next]
 
-	var nextIdx int
-	if next < len(topic) && topic[next] == '/' {
-		nextIdx = next + 1
-	} else {
-		nextIdx = next
-	}
+	// An index past the end marks exhaustion; an index at the end is an empty level.
+	nextIdx := next + 1
 
 	t.match(n.children[level], topic, nextIdx, out)
+	if idx == 0 && len(topic) > 0 && topic[0] == '$' {
+		return
+	}
 	t.match(n.children["+"], topic, nextIdx, out)
 
 	if hash := n.children["#"]; hash != nil {

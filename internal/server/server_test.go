@@ -20,6 +20,96 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStart_ShouldEnforcePacketSize_WhenConfiguredLimitIsExceeded(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		afterConnect bool
+	}{
+		{"connect", false}, {"publish", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, connections, stop := startPipeTestServer(t, WithMaxPacketSize(64))
+				defer stop()
+				serverConn, conn := net.Pipe()
+				defer conn.Close()
+				connections <- serverConn
+				setDeadline(t, conn)
+				if tc.afterConnect {
+					_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: "limited", cleanSession: true}))
+					require.NoError(t, err)
+					readConnAck(t, conn)
+				}
+				header := byte(0x10)
+				if tc.afterConnect {
+					header = 0x30
+				}
+				// No body is sent: the declared size must suffice to reject the packet.
+				_, err := conn.Write([]byte{header, 63})
+				require.NoError(t, err)
+				synctest.Wait()
+				_, err = conn.Read(make([]byte, 1))
+				require.ErrorIs(t, err, io.EOF)
+			})
+		})
+	}
+}
+
+func TestStart_ShouldRejectPacketSizeOption_WhenLimitIsInvalid(t *testing.T) {
+	for _, limit := range []int{0, -1, protocol.MaxPacketSize + 1} {
+		srv := newTestServer(WithMaxPacketSize(limit), WithListener(func(string, string) (net.Listener, error) {
+			t.Fatal("invalid configuration must fail before listening")
+			return nil, nil
+		}))
+		require.Error(t, srv.Start(context.Background()))
+	}
+}
+
+func TestStart_ShouldMatchRetainedAndLiveMessagesConsistently_WhenFiltersUseWildcards(t *testing.T) {
+	for _, tc := range []struct {
+		filter string
+		topic  string
+		match  bool
+	}{
+		{"a/#", "a", true}, {"a/+", "a/", true}, {"a", "a/", false},
+		{"#", "$SYS/status", false}, {"+/status", "$SYS/status", false},
+		{"$SYS/#", "$SYS/status", true},
+	} {
+		t.Run(tc.filter+":"+tc.topic, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, connections, stop := startPipeTestServer(t)
+				defer stop()
+				publisher, _ := connectPipeClient(t, connections, "publisher")
+				defer publisher.Close()
+				writePublish(t, publisher, &protocol.PublishPacket{Topic: tc.topic, Payload: []byte("retained"), Retain: true, QoS: 1, PacketID: 1})
+				assert.Equal(t, []byte{0x40, 2, 0, 1}, readPacketBytes(t, publisher))
+				subscriber, _ := connectPipeClient(t, connections, "subscriber")
+				defer subscriber.Close()
+				_, err := subscriber.Write(encodeSubscribePacket(t, 1, tc.filter, 0))
+				require.NoError(t, err)
+				if tc.match {
+					packet := decodeClientPacket(t, subscriber)
+					pub, ok := packet.(*protocol.PublishPacket)
+					require.True(t, ok)
+					assert.True(t, pub.Retain)
+					assert.Equal(t, []byte("retained"), pub.Payload)
+				}
+				assert.Equal(t, []byte{0x90, 3, 0, 1, 0}, readPacketBytes(t, subscriber))
+				writePublish(t, publisher, &protocol.PublishPacket{Topic: tc.topic, Payload: []byte("live"), QoS: 1, PacketID: 2})
+				assert.Equal(t, []byte{0x40, 2, 0, 2}, readPacketBytes(t, publisher))
+				if tc.match {
+					packet := decodeClientPacket(t, subscriber)
+					pub, ok := packet.(*protocol.PublishPacket)
+					require.True(t, ok)
+					assert.Equal(t, []byte("live"), pub.Payload)
+				} else {
+					assertNoPacket(t, subscriber)
+				}
+			})
+		})
+	}
+}
+
 func TestStart_ShouldWaitForWriterExit_WhenContextIsCancelled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		_, connections, stop := startPipeTestServer(t)

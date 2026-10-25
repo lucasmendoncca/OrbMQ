@@ -5,12 +5,104 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"strings"
 	"testing"
 	"testing/iotest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDecodeWithLimit_ShouldEnforcePacketSize_WhenHeaderDeclaresLength(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		input    []byte
+		limit    int
+		tooLarge bool
+	}{
+		{"ping at limit", []byte{0xc0, 0}, 2, false},
+		{"ping above limit", []byte{0xc0, 0}, 1, true},
+		{"publish at limit", []byte{0x30, 3, 0, 1, 'a'}, 5, false},
+		{"publish header only", []byte{0x30, 127}, 128, true},
+		{"multibyte header only", []byte{0x30, 0x80, 1}, 130, true},
+		{"nonminimal header", []byte{0xc0, 0x80, 0}, 2, true},
+		{"maximum declared size", []byte{0x30, 0xff, 0xff, 0xff, 0x7f}, 1024, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecodeWithLimit(bytes.NewReader(tc.input), tc.limit)
+			if tc.tooLarge {
+				require.ErrorIs(t, err, ErrPacketTooLarge)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+	for _, limit := range []int{0, -1, MaxPacketSize + 1} {
+		_, err := DecodeWithLimit(bytes.NewReader(nil), limit)
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, io.EOF)
+	}
+}
+
+func TestDecode_ShouldValidateTopicsAndFilters_WhenPacketsContainNames(t *testing.T) {
+	for _, value := range []string{"", "a/+b", "a/#/b", "a+", "a#", "a/\xff", "a/\x00"} {
+		t.Run(value, func(t *testing.T) {
+			packets := [][]byte{
+				buildPublishPacket(0x30, 0, value, nil),
+				buildConnectPacket(connectPacketOptions{clientID: "client", cleanSession: true, will: &WillMessage{Topic: value}}),
+				buildSubscribePacket(1, []subscriptionInput{{topic: value}}),
+				buildUnsubscribePacket(1, []string{value}),
+			}
+			for _, raw := range packets {
+				_, err := Decode(bytes.NewReader(raw))
+				require.Error(t, err)
+			}
+		})
+	}
+	for _, value := range []string{"a/+", "a/#", "+", "#"} {
+		_, err := Decode(bytes.NewReader(buildPublishPacket(0x30, 0, value, nil)))
+		require.Error(t, err)
+		_, err = Decode(bytes.NewReader(buildConnectPacket(connectPacketOptions{clientID: "client", cleanSession: true, will: &WillMessage{Topic: value}})))
+		require.Error(t, err)
+		_, err = Decode(bytes.NewReader(buildSubscribePacket(1, []subscriptionInput{{topic: value}})))
+		require.NoError(t, err)
+		_, err = Decode(bytes.NewReader(buildUnsubscribePacket(1, []string{value})))
+		require.NoError(t, err)
+	}
+	for _, value := range []string{"/", "a//b/", "温度", "\ufefftopic", "$SYS/status", strings.Repeat("a", 65535)} {
+		_, err := Decode(bytes.NewReader(buildPublishPacket(0x30, 0, value, []byte{0xff, 0})))
+		require.NoError(t, err)
+	}
+}
+
+func TestDecode_ShouldValidateStrings_WhenConnectContainsTextOrBinaryFields(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{"unicode", "café/温度", true},
+		{"bom preserved", "\ufeffclient", true},
+		{"invalid byte", "\xff", false},
+		{"overlong", "\xc0\x80", false},
+		{"surrogate", "\xed\xa0\x80", false},
+		{"null", "a\x00b", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkt, err := Decode(bytes.NewReader(buildConnectPacket(connectPacketOptions{cleanSession: true, clientID: tc.value})))
+			if !tc.valid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.value, pkt.(*ConnectPacket).ClientID)
+		})
+	}
+	password := "\xff\x00"
+	pkt, err := Decode(bytes.NewReader(buildConnectPacket(connectPacketOptions{cleanSession: true, clientID: "client", username: stringPtr("user"), password: &password})))
+	require.NoError(t, err)
+	assert.Equal(t, password, *pkt.(*ConnectPacket).Password)
+}
 
 const (
 	decoderClientID     = "client123"
@@ -551,13 +643,13 @@ func TestDecode_ShouldReturnError_WhenPacketTypeIsUnsupported(t *testing.T) {
 }
 
 func TestDecodeRemainingLength_ShouldDecodeMultiByteValue_WhenInputIsValid(t *testing.T) {
-	value, err := decodeRemainingLength(bytes.NewReader([]byte{0xC1, 0x02}))
+	value, _, err := decodeRemainingLength(bytes.NewReader([]byte{0xC1, 0x02}))
 	require.NoError(t, err)
 	assert.Equal(t, 321, value)
 }
 
 func TestDecodeRemainingLength_ShouldReturnError_WhenReaderFails(t *testing.T) {
-	_, err := decodeRemainingLength(errReader{err: io.ErrUnexpectedEOF})
+	_, _, err := decodeRemainingLength(errReader{err: io.ErrUnexpectedEOF})
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 

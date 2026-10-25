@@ -7,6 +7,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMatchFilter_ShouldRespectTopicLevels_WhenWildcardsAreUsed(t *testing.T) {
+	for _, tc := range []struct {
+		filter, topic string
+		match         bool
+	}{
+		{"a/#", "a", true}, {"a/#", "a/", true},
+		{"a/+", "a", false}, {"a/+", "a/", true},
+		{"a", "a/", false}, {"a/", "a", false},
+		{"#", "$SYS/status", false}, {"+/status", "$SYS/status", false},
+		{"$SYS/#", "$SYS", true}, {"$SYS/+", "$SYS/status", true},
+		{"a/+", "a/$status", true}, {"#", "/$SYS", true},
+	} {
+		t.Run(tc.filter+":"+tc.topic, func(t *testing.T) { assert.Equal(t, tc.match, MatchFilter(tc.filter, tc.topic)) })
+	}
+}
+
 func TestMatchFilter_ShouldReturnTrue_WhenFilterAndTopicMatchExactly(t *testing.T) {
 	result := MatchFilter("sensors/temperature", "sensors/temperature")
 
