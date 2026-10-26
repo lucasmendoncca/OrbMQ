@@ -274,7 +274,7 @@ func TestBrokerRetainedMatching_ShouldDeleteRetainedMessage_WhenRetainedPublishH
 	assert.Empty(t, broker.RetainedMatching("sensors/#"))
 }
 
-func TestBrokerPublish_ShouldEvictSlowClientAndCloseSubscriber_WhenDeliverReturnsClientQueueFull(t *testing.T) {
+func TestBrokerPublish_ShouldPreserveSubscriptions_WhenDeliveryTransportIsFull(t *testing.T) {
 	broker := New()
 	slow := &closableStubSubscriber{id: "client-1"}
 	fast := &stubSubscriber{id: "client-2"}
@@ -295,7 +295,7 @@ func TestBrokerPublish_ShouldEvictSlowClientAndCloseSubscriber_WhenDeliverReturn
 	})
 
 	require.ElementsMatch(t, []string{slow.ID(), fast.ID()}, firstDelivered)
-	assert.Equal(t, 1, slow.closeCount)
+	assert.Equal(t, 0, slow.closeCount)
 
 	var secondDelivered []string
 	broker.Publish(&protocol.PublishPacket{
@@ -306,7 +306,7 @@ func TestBrokerPublish_ShouldEvictSlowClientAndCloseSubscriber_WhenDeliverReturn
 		return nil
 	})
 
-	assert.Equal(t, []string{fast.ID()}, secondDelivered)
+	assert.ElementsMatch(t, []string{slow.ID(), fast.ID()}, secondDelivered)
 }
 
 func TestBrokerPublish_ShouldNotEvictSubscriber_WhenDeliverReturnsDifferentError(t *testing.T) {

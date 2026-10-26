@@ -43,6 +43,9 @@ func (c *Client) ID() string {
 	return c.id
 }
 
+// Done is closed when the connection is closed, including writer failures.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
 // Enqueue adds a message to the client's send queue, which is
 // written to the underlying connection by the writeLoop goroutine.
 // If the send queue is full, the function returns ErrClientQueueFull.

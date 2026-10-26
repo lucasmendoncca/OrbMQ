@@ -11,7 +11,6 @@ type node struct {
 
 type Subscriber interface {
 	ID() string
-	Enqueue([]byte) error
 }
 
 type Subscription struct {

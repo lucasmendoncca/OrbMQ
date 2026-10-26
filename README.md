@@ -37,14 +37,14 @@ Current packet support:
 Not implemented yet as complete broker capabilities:
 
 - MQTT 5 support
-- durable session storage and queueing of new messages for offline subscribers
+- durable session storage across process restarts
 - session expiry
 - QoS 2 flows
 - TLS, authentication, and authorization
 - clustering
 - management API and UI
 
-Session state and retained messages are stored only in memory and are lost when the process exits. With `CleanSession=true`, previous session state is discarded and the new session is removed on disconnect. With `CleanSession=false`, subscriptions and unacknowledged outbound QoS 1 messages survive disconnects within the same broker process; pending messages are replayed with `DUP=true` on reconnect. New publications are not queued for offline subscribers.
+Session state and retained messages are stored only in memory and are lost when the process exits. With `CleanSession=true`, previous session state is discarded and the new session is removed on disconnect. With `CleanSession=false`, subscriptions and unacknowledged outbound QoS 1 messages survive disconnects within the same broker process; pending messages are replayed with `DUP=true` on reconnect. New outbound QoS 1 deliveries are queued while persistent sessions are offline. Unsent deliveries start with DUP=false; previously attempted deliveries resume with the same Packet ID and DUP=true, in original send order.
 
 Subscriptions requesting QoS 2 are granted QoS 1. The QoS 2 publish handshake is not implemented.
 
@@ -117,9 +117,9 @@ Some notable implementation choices in the current broker:
   - each client has a buffered queue and dedicated write loop
   - control responses and publications share the same FIFO queue; only the write loop writes to the connection
   - control responses wait for their write to finish, preserving responses before a subsequent DISCONNECT
-  - reconnects write CONNACK first, enqueue pending QoS 1 replay, then reactivate subscriptions for live delivery
-  - retained messages for a subscription are queued before its SUBACK
-  - a full queue rejects new packets immediately; the server closes the affected connection for control or replay failures, and evicts slow subscribers during fan-out
+  - subscriptions belong to sessions and remain routable during disconnect and reconnect; CONNACK precedes replay, followed by unsent deliveries
+  - SUBACK is written before retained messages are delivered
+  - transport failures close the affected connection without deleting persistent subscriptions or accepted QoS 1 deliveries
 - **Subscriber abstraction**
   - the broker depends on an interface instead of a concrete client type
 - **Connection lifecycle and ownership**
@@ -127,7 +127,7 @@ Some notable implementation choices in the current broker:
   - cancellation closes the listener and all connections, including incomplete handshakes; `Start` waits for connection handlers and writers to exit
   - shutdown interrupts pending writes rather than draining queues; persistent in-memory sessions retain unacknowledged QoS 1 messages
   - replacing a Client ID closes its previous connection and waits for its cleanup before opening the new session
-  - a shared registry read lock keeps each fan-out and slow-client eviction within the same ownership lifetime; concurrent publishers can still run together
+  - a shared registry read lock keeps fan-out admission within one session ownership lifetime; an active delivery consumer runs alongside the packet reader and exits before connection ownership is released
 - **Allocation-aware publish path**
   - pooling is used to reduce pressure on hot-path subscriber matching
 
@@ -146,7 +146,41 @@ These patterns should continue to guide future work, especially when extending t
 go run ./cmd/orbmq/main.go
 ```
 
-The executable listens on `:1883` (all interfaces). The address is set in `cmd/orbmq/main.go`; there are currently no command-line flags or environment variables to configure it. Connections use plain TCP without authentication or authorization; CONNECT credentials are parsed but not validated.
+The executable loads the required `config.yaml` from its working directory and listens on `:1883` (all interfaces) by default. Use `go run ./cmd/orbmq/main.go -config path/to/config.yaml` to select another file. Configuration is loaded once before listening; there is no reload or environment override. Connections use plain TCP without authentication or authorization; CONNECT credentials are parsed but not authenticated.
+
+### Configuration and session capacity
+
+The root `config.yaml` configures the listening address, handshake timeout,
+incoming packet limit, session budgets and observation intervals. Missing fields
+use documented defaults; a missing file, unknown fields, nulls, aliases, multiple
+documents or invalid values stop startup. Byte limits use integer bytes and
+durations use strings such as `10s`. All limits and intervals must be positive.
+
+| Resource | Per session | Global |
+|---|---:|---:|
+| Pending QoS 1 deliveries | 1,000 | 100,000 |
+| Pending encoded bytes | 16 MiB | 256 MiB |
+| Deliveries awaiting PUBACK | 20 | Included in global budgets |
+
+Pending totals include unsent and unacknowledged deliveries, including connected
+clean sessions. Each destination is charged the complete encoded PUBLISH size;
+shared payloads do not reduce the logical charge. Counters are released once on
+PUBACK or session deletion, not when moving messages into the transport queue.
+These are not process memory limits: retained messages, connections, session
+metadata and transport copies consume additional memory. Sessions have no expiry.
+
+If a local or global budget is exhausted, new deliveries that do not fit are
+dropped. Existing deliveries and subscriptions remain intact, and publishers
+still receive PUBACK. Other destinations continue independently; a global limit
+can also affect healthy subscribers. There is no all-or-nothing fan-out or
+capacity reservation for a particular subscriber. Local saturation takes
+precedence when recording the reason. QoS 1 therefore does not promise absence
+of loss under capacity exhaustion. QoS 0 is never queued offline.
+
+`Store.Snapshot` and `State.Snapshot` expose occupancy, inflight counts, drop
+counters and oldest pending age. Aggregate summaries are logged every 30 seconds;
+saturation deltas are aggregated once per reason every 10 seconds. Both intervals
+are configurable. There is no HTTP metrics endpoint or Client ID metric label.
 
 ### Publish and subscribe
 
@@ -202,7 +236,7 @@ go test -run='^$' -bench=. -benchmem ./internal/broker/...
 Planned evolution areas include:
 
 - full MQTT 5 protocol support
-- durable session storage, offline message queueing, and session expiry
+- durable session storage and session expiry
 - QoS 2 support
 - TLS, authentication, and authorization
 - metrics and observability

@@ -87,6 +87,7 @@ func TestStart_ShouldMatchRetainedAndLiveMessagesConsistently_WhenFiltersUseWild
 				defer subscriber.Close()
 				_, err := subscriber.Write(encodeSubscribePacket(t, 1, tc.filter, 0))
 				require.NoError(t, err)
+				assert.Equal(t, []byte{0x90, 3, 0, 1, 0}, readPacketBytes(t, subscriber))
 				if tc.match {
 					packet := decodeClientPacket(t, subscriber)
 					pub, ok := packet.(*protocol.PublishPacket)
@@ -94,7 +95,7 @@ func TestStart_ShouldMatchRetainedAndLiveMessagesConsistently_WhenFiltersUseWild
 					assert.True(t, pub.Retain)
 					assert.Equal(t, []byte("retained"), pub.Payload)
 				}
-				assert.Equal(t, []byte{0x90, 3, 0, 1, 0}, readPacketBytes(t, subscriber))
+
 				writePublish(t, publisher, &protocol.PublishPacket{Topic: tc.topic, Payload: []byte("live"), QoS: 1, PacketID: 2})
 				assert.Equal(t, []byte{0x40, 2, 0, 2}, readPacketBytes(t, publisher))
 				if tc.match {
@@ -405,65 +406,140 @@ func TestStart_ShouldSerializeResponsesAndDeliveries_WhenSubscriberWriteIsBlocke
 	}
 }
 
-func TestStart_ShouldSendConnAckThenReplayBeforeLiveDeliveries_WhenSessionReconnects(t *testing.T) {
+func TestStart_ShouldRecoverOfflineAndConcurrentDeliveries_WhenSessionReconnects(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		replayStarted := make(chan struct{})
-		releaseReplay := make(chan struct{})
-		unblockReplay := sync.OnceFunc(func() { close(releaseReplay) })
-		srv, connections, stop := startPipeTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
-			if pub.DUP && string(pub.Payload) == "first" {
-				close(replayStarted)
-				<-releaseReplay
-			}
-			return encodePublishPacket(pub)
-		}))
+		_, connections, stop := startPipeTestServer(t)
 		defer stop()
-		defer unblockReplay()
-		state, _ := srv.sessions.GetOrCreate("persistent-sub")
-		state.SetSubscription("sensors/#", 1)
-		for _, payload := range []string{"first", "second"} {
-			_, err := state.TrackOutbound(&protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte(payload), QoS: 1})
-			require.NoError(t, err)
-		}
-		pub, _ := connectPipeClient(t, connections, "publisher")
-		defer pub.Close()
-		serverConn, sub := net.Pipe()
-		defer sub.Close()
-		observed := &observedWriteConn{Conn: serverConn, writeGate: make(chan struct{}, 1)}
-		connections <- observed
-		setDeadline(t, sub)
-		_, err := sub.Write(encodeConnectPacket(t, connectOptions{clientID: "persistent-sub"}))
+		old := connectPersistentPipeClient(t, connections, "persistent")
+		subscribe(t, old, 1, "sensors/#", 1, []byte{1})
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("first"), QoS: 1, PacketID: 1})
+		_ = decodeClientPacket(t, publisher)
+		first := decodeClientPacket(t, old).(*protocol.PublishPacket)
+		require.NoError(t, old.Close())
+		synctest.Wait()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("offline"), QoS: 1, PacketID: 2})
+		_ = decodeClientPacket(t, publisher)
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("qos0 offline")})
+		serverConn, conn := net.Pipe()
+		defer conn.Close()
+		connections <- serverConn
+		setDeadline(t, conn)
+		_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: "persistent"}))
 		require.NoError(t, err)
 		synctest.Wait()
-
-		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("during connect"), QoS: 1, PacketID: 7})
-		_ = decodeClientPacket(t, pub)
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("during connect"), QoS: 1, PacketID: 3})
+		_ = decodeClientPacket(t, publisher)
+		assert.True(t, readConnAck(t, conn))
 		synctest.Wait()
-		assert.False(t, observed.concurrent.Load())
-		assert.True(t, readConnAck(t, sub))
-		<-replayStarted
-		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("during replay"), QoS: 1, PacketID: 8})
-		_ = decodeClientPacket(t, pub)
-		unblockReplay()
-
-		for i, payload := range []string{"first", "second"} {
-			packet := decodeClientPacket(t, sub)
-			replayed, ok := packet.(*protocol.PublishPacket)
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("during replay"), QoS: 1, PacketID: 4})
+		_ = decodeClientPacket(t, publisher)
+		for i, payload := range []string{"first", "offline", "during connect", "during replay"} {
+			packet := decodeClientPacket(t, conn)
+			pub, ok := packet.(*protocol.PublishPacket)
 			require.True(t, ok)
-			assert.Equal(t, payload, string(replayed.Payload))
-			assert.Equal(t, uint16(i+1), replayed.PacketID)
-			assert.True(t, replayed.DUP)
+			assert.Equal(t, payload, string(pub.Payload))
+			assert.Equal(t, i == 0, pub.DUP)
+			if i == 0 {
+				assert.Equal(t, first.PacketID, pub.PacketID)
+			}
+			writePubAck(t, conn, pub.PacketID)
 		}
-		_, err = sub.Write([]byte{0xC0, 0x00})
+		assertNoPacket(t, conn)
+	})
+}
+
+func TestStart_ShouldIsolateSaturation_WhenPersistentSubscriberIsOffline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxPendingMessagesPerSession = 1
+		limits.MaxInflightMessagesPerSession = 1
+		store, err := session.NewWithLimits(limits)
 		require.NoError(t, err)
-		assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, sub))
-		writePublish(t, pub, &protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("live"), QoS: 1, PacketID: 9})
-		_ = decodeClientPacket(t, pub)
-		packet := decodeClientPacket(t, sub)
-		live, ok := packet.(*protocol.PublishPacket)
-		require.True(t, ok)
-		assert.Equal(t, []byte("live"), live.Payload)
-		assert.False(t, live.DUP)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		slow := connectPersistentPipeClient(t, connections, "offline")
+		subscribe(t, slow, 1, "sensors/#", 1, []byte{1})
+		writeDisconnect(t, slow)
+		require.NoError(t, slow.Close())
+		synctest.Wait()
+		fast, _ := connectPipeClient(t, connections, "healthy")
+		defer fast.Close()
+		subscribe(t, fast, 1, "sensors/#", 1, []byte{1})
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		for i := range 3 {
+			writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte{byte(i)}, QoS: 1, PacketID: uint16(i + 1)})
+			assert.Equal(t, []byte{0x40, 2, 0, byte(i + 1)}, readPacketBytes(t, publisher))
+			pub := decodeClientPacket(t, fast).(*protocol.PublishPacket)
+			assert.Equal(t, []byte{byte(i)}, pub.Payload)
+			writePubAck(t, fast, pub.PacketID)
+			synctest.Wait()
+		}
+		stats := store.Snapshot()
+		assert.Equal(t, uint64(2), stats.SessionLimitDrops)
+		assert.Equal(t, 1, stats.PendingMessages)
+		reconnected := connectPersistentPipeClient(t, connections, "offline")
+		defer reconnected.Close()
+		pub := decodeClientPacket(t, reconnected).(*protocol.PublishPacket)
+		assert.Equal(t, []byte{0}, pub.Payload, "oldest accepted delivery must survive")
+		assert.False(t, pub.DUP)
+		writePubAck(t, reconnected, pub.PacketID)
+		synctest.Wait()
+		assert.Zero(t, store.Snapshot().PendingMessages)
+	})
+}
+
+func TestStart_ShouldPreserveUnwrittenDelivery_WhenConnectionFailsDuringSend(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, connections, stop := startPipeTestServer(t)
+		defer stop()
+		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		subscribe(t, conn, 1, "sensors/#", 1, []byte{1})
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("blocked"), QoS: 1, PacketID: 1})
+		_ = decodeClientPacket(t, publisher)
+		synctest.Wait()
+		require.NoError(t, conn.Close())
+		synctest.Wait()
+		replacement := connectPersistentPipeClient(t, connections, "subscriber")
+		defer replacement.Close()
+		pub := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+		assert.Equal(t, []byte("blocked"), pub.Payload)
+		assert.True(t, pub.DUP)
+	})
+}
+
+func TestStart_ShouldPreserveAcceptedDeliveries_WhenSubscriptionIsRemoved(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxInflightMessagesPerSession = 1
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		defer conn.Close()
+		subscribe(t, conn, 1, "sensors/#", 1, []byte{1})
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		for i := range 2 {
+			writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte{byte(i)}, QoS: 1, PacketID: uint16(i + 1)})
+			_ = decodeClientPacket(t, publisher)
+		}
+		first := decodeClientPacket(t, conn).(*protocol.PublishPacket)
+		_, err = conn.Write(encodeUnsubscribePacketForTest(t, 2, "sensors/#"))
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xb0, 2, 0, 2}, readPacketBytes(t, conn))
+		writePubAck(t, conn, first.PacketID)
+		second := decodeClientPacket(t, conn).(*protocol.PublishPacket)
+		assert.Equal(t, []byte{1}, second.Payload)
+		writePubAck(t, conn, second.PacketID)
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte("later"), QoS: 1, PacketID: 3})
+		_ = decodeClientPacket(t, publisher)
+		assertNoPacket(t, conn)
 	})
 }
 
@@ -497,26 +573,33 @@ func TestStart_ShouldCloseConnection_WhenResponseQueueIsFull(t *testing.T) {
 	})
 }
 
-func TestStart_ShouldPreservePendingMessages_WhenReplayQueueIsFull(t *testing.T) {
+func TestStart_ShouldDrainBacklogGradually_WhenQueueExceedsTransportCapacity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		srv, connections, stop := startPipeTestServer(t)
-		defer stop()
-		state, _ := srv.sessions.GetOrCreate("persistent-sub")
-		for range 1026 {
-			_, err := state.TrackOutbound(&protocol.PublishPacket{Topic: "sensors/temp", Payload: []byte("pending"), QoS: 1})
-			require.NoError(t, err)
-		}
-		serverConn, conn := net.Pipe()
-		defer conn.Close()
-		connections <- serverConn
-		setDeadline(t, conn)
-		_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: "persistent-sub"}))
+		limits := session.DefaultLimits()
+		limits.MaxPendingMessagesPerSession = 1500
+		limits.MaxInflightMessagesPerSession = 2
+		store, err := session.NewWithLimits(limits)
 		require.NoError(t, err)
-		assert.True(t, readConnAck(t, conn))
-		synctest.Wait()
-		_, err = conn.Read(make([]byte, 1))
-		require.ErrorIs(t, err, io.EOF)
-		assert.Len(t, state.ReplayPending(), 1026)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		state, _ := store.GetOrCreate("persistent")
+		for range 1026 {
+			admitForTest(t, state, "pending")
+		}
+		conn := connectPersistentPipeClient(t, connections, "persistent")
+		defer conn.Close()
+		for range 1026 {
+			packet := decodeClientPacket(t, conn)
+			pub, ok := packet.(*protocol.PublishPacket)
+			require.True(t, ok)
+			assert.False(t, pub.DUP)
+			assert.LessOrEqual(t, state.Snapshot().InflightMessages, 2)
+			writePubAck(t, conn, pub.PacketID)
+		}
+		_, err = conn.Write([]byte{0xc0, 0})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xd0, 0}, readPacketBytes(t, conn))
+		assert.Zero(t, state.Snapshot().PendingMessages)
 	})
 }
 
@@ -891,24 +974,36 @@ func TestStart_ShouldAttemptConnAck_WhenAcceptedConnectionWriteFails(t *testing.
 	assert.GreaterOrEqual(t, conn.writeCalls.Load(), int32(1))
 }
 
-func TestStart_ShouldStopConnectionAfterReplayInflightEncodingFails_WhenPersistentSessionReconnects(t *testing.T) {
-	srv := startTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
-		return nil, errors.New("encode failed")
-	}))
-
-	state, _ := srv.srv.sessions.GetOrCreate("replay-fail")
-	_, err := state.TrackOutbound(&protocol.PublishPacket{
-		Topic:   "replay/topic",
-		Payload: []byte("x"),
-		QoS:     1,
+func TestStart_ShouldKeepInflightWindowBounded_WhenSubscriberDoesNotAcknowledge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxInflightMessagesPerSession = 1
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		state, _ := store.GetOrCreate("persistent")
+		admitForTest(t, state, "first")
+		admitForTest(t, state, "second")
+		conn := connectPersistentPipeClient(t, connections, "persistent")
+		defer conn.Close()
+		first := decodeClientPacket(t, conn).(*protocol.PublishPacket)
+		assertNoPacket(t, conn)
+		setDeadline(t, conn)
+		_, err = conn.Write([]byte{0xc0, 0})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0xd0, 0}, readPacketBytes(t, conn))
+		writePubAck(t, conn, first.PacketID)
+		second := decodeClientPacket(t, conn).(*protocol.PublishPacket)
+		assert.Equal(t, []byte("second"), second.Payload)
+		require.NoError(t, conn.Close())
+		synctest.Wait()
+		replacement := connectPersistentPipeClient(t, connections, "persistent")
+		defer replacement.Close()
+		replay := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+		assert.True(t, replay.DUP)
+		assert.Equal(t, second.PacketID, replay.PacketID)
 	})
-	require.NoError(t, err)
-
-	conn, sessionPresent := connectClient(t, srv, connectOptions{clientID: "replay-fail", cleanSession: false})
-	defer conn.Close()
-
-	assert.True(t, sessionPresent)
-	assertConnectionEventuallyClosed(t, conn, 2*time.Second)
 }
 
 func TestStart_ShouldCloseConnectionAfterKeepAliveTimeout_WhenClientStopsSendingPackets(t *testing.T) {
@@ -1032,32 +1127,31 @@ func TestStart_ShouldEncodeQoS1PublishOnlyOnce_WhenMultipleSubscribersMatch(t *t
 	assert.Equal(t, int32(1), encodeCalls.Load())
 }
 
-func TestStart_ShouldCloseSubscriberConnectionWithoutSubAck_WhenRetainedDeliveryExhaustsPacketIDs(t *testing.T) {
-	srv := startTestServer(t)
-
-	pubConn, _ := connectClient(t, srv, connectOptions{clientID: "retained-source", cleanSession: true})
-	defer pubConn.Close()
-	writePublish(t, pubConn, &protocol.PublishPacket{
-		Topic:    "retained/exhaust",
-		Payload:  []byte("value"),
-		Retain:   true,
-		QoS:      1,
-		PacketID: 33,
+func TestStart_ShouldAcknowledgeSubscription_WhenRetainedDeliveryExceedsCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxPendingMessagesPerSession = 1
+		limits.MaxInflightMessagesPerSession = 1
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		for i, name := range []string{"retained/a", "retained/b"} {
+			writePublish(t, publisher, &protocol.PublishPacket{Topic: name, Payload: []byte("value"), Retain: true, QoS: 1, PacketID: uint16(i + 1)})
+			_ = decodeClientPacket(t, publisher)
+		}
+		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		defer conn.Close()
+		subscribe(t, conn, 1, "retained/#", 1, []byte{1})
+		pub := decodeClientPacket(t, conn).(*protocol.PublishPacket)
+		assert.True(t, pub.Retain)
+		state, ok := store.Get("subscriber")
+		require.True(t, ok)
+		assert.Equal(t, uint64(1), state.Snapshot().SessionLimitDrops)
+		assert.Equal(t, 1, state.Snapshot().PendingMessages)
 	})
-	_ = decodeClientPacket(t, pubConn)
-
-	subConn, _ := connectClient(t, srv, connectOptions{clientID: "retained-exhaust", cleanSession: false})
-	defer subConn.Close()
-
-	state, ok := srv.srv.sessions.Get("retained-exhaust")
-	require.True(t, ok)
-	exhaustPacketIDs(t, state)
-
-	setDeadline(t, subConn)
-	_, err := subConn.Write(encodeSubscribePacket(t, 1, "retained/#", 1))
-	require.NoError(t, err)
-
-	assertConnectionEventuallyClosed(t, subConn, 2*time.Second)
 }
 
 func TestNew_ShouldApplyFunctionalOptions_WhenProvided(t *testing.T) {
@@ -1237,6 +1331,11 @@ func TestStart_ShouldAcceptConnectionAndHandleIt_WhenAcceptSucceeds(t *testing.T
 // Pipe connections make blocked writes and concurrent handlers deterministic in synctest.
 func startPipeTestServer(t *testing.T, opts ...Option) (*Server, chan<- net.Conn, func()) {
 	t.Helper()
+	return startPipeTestServerWithStore(t, session.New(), opts...)
+}
+
+func startPipeTestServerWithStore(t *testing.T, sessions *session.Store, opts ...Option) (*Server, chan<- net.Conn, func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	connections := make(chan net.Conn)
 	listener := &stubListener{
@@ -1252,7 +1351,7 @@ func startPipeTestServer(t *testing.T, opts ...Option) (*Server, chan<- net.Conn
 		addrFn:  func() net.Addr { return stubAddr("pipe") },
 	}
 	allOpts := append([]Option{WithListener(func(string, string) (net.Listener, error) { return listener, nil })}, opts...)
-	srv := newTestServer(allOpts...)
+	srv := New(":0", broker.New(), sessions, allOpts...)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start(ctx) }()
 	return srv, connections, func() {
@@ -1707,15 +1806,23 @@ func writeRemainingLength(t *testing.T, w io.Writer, length int) {
 	}
 }
 
-func exhaustPacketIDs(t *testing.T, sess *session.State) {
+func admitForTest(t *testing.T, state *session.State, payload string) {
 	t.Helper()
+	packet := &protocol.PublishPacket{Topic: "sensors/a", Payload: []byte(payload), QoS: 1}
+	template, err := newPublishTemplate(encodePublishPacket, packet)
+	require.NoError(t, err)
+	reason, err := state.Admit(template.raw, template.packetIDOffset)
+	require.NoError(t, err)
+	require.Empty(t, reason)
+}
 
-	for i := 0; i < 65535; i++ {
-		_, err := sess.TrackOutbound(&protocol.PublishPacket{
-			Topic:   "exhaust/topic",
-			Payload: []byte("x"),
-			QoS:     1,
-		})
-		require.NoError(t, err)
-	}
+func connectPersistentPipeClient(t *testing.T, connections chan<- net.Conn, id string) net.Conn {
+	t.Helper()
+	serverConn, conn := net.Pipe()
+	connections <- serverConn
+	setDeadline(t, conn)
+	_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: id}))
+	require.NoError(t, err)
+	readConnAck(t, conn)
+	return conn
 }

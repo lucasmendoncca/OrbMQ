@@ -1,12 +1,10 @@
 package broker
 
 import (
-	"errors"
 	"maps"
 	"sync"
 	"sync/atomic"
 
-	"github.com/lucasmendoncca/OrbMQ/internal/client"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 )
@@ -54,11 +52,7 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, deliver func(topic.Subscri
 	subs := tree.Match(pub.Topic)
 
 	for _, sub := range subs {
-		if err := deliver(sub); err != nil {
-			if errors.Is(err, client.ErrClientQueueFull) {
-				b.evictSlowClient(sub.Subscriber)
-			}
-		}
+		_ = deliver(sub)
 	}
 
 	topic.PutSubs(subs)
@@ -127,14 +121,4 @@ func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
 	}
 
 	b.retained.Store(newMap)
-}
-
-func (b *Broker) evictSlowClient(sub topic.Subscriber) {
-	id := sub.ID()
-
-	b.UnsubscribeAll(id)
-
-	if c, ok := sub.(interface{ Close() }); ok {
-		c.Close()
-	}
 }

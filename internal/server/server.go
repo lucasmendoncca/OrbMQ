@@ -40,6 +40,7 @@ type activeConnection struct {
 	session      *session.State
 	cleanSession bool
 	closing      bool
+	ready        bool
 	done         chan struct{}
 }
 
@@ -208,6 +209,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	var owner *activeConnection
+	var consumerDone <-chan struct{}
 	defer func() {
 		if owner != nil {
 			s.clientsMu.Lock()
@@ -215,6 +217,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			s.clientsMu.Unlock()
 		}
 		cli.Close()
+		if consumerDone != nil {
+			<-consumerDone
+		}
 		cli.Wait()
 		if owner != nil {
 			s.closeSession(owner)
@@ -242,14 +247,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if err := s.replayInflight(cli, sess); err != nil {
-		log.Printf("replay inflight error: %v", err)
-		return
-	}
-	// Make live deliveries visible only after CONNACK and replay are queued.
-	for _, sub := range sess.SnapshotSubscriptions() {
-		s.broker.Subscribe(sub.Filter, sub.QoS, cli)
-	}
+	s.clientsMu.Lock()
+	owner.ready = true
+	s.clientsMu.Unlock()
+	done := make(chan struct{})
+	consumerDone = done
+	epoch := sess.BeginDelivery()
+	go func() {
+		defer close(done)
+		s.consumeDeliveries(ctx, cli, sess, epoch)
+	}()
 
 	cleanDisconnect := false
 	defer func() {
@@ -282,6 +289,7 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.Conne
 // openSession restores a persistent session or creates a clean one.
 func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, bool) {
 	if connect.CleanSession {
+		s.broker.UnsubscribeAll(connect.ClientID)
 		s.sessions.Delete(connect.ClientID)
 		state, _ := s.sessions.GetOrCreate(connect.ClientID)
 		return state, false
@@ -302,6 +310,9 @@ func (s *Server) acquireConnection(ctx context.Context, connect *protocol.Connec
 		previous := s.clients[cli.ID()]
 		if previous == nil {
 			state, present := s.openSession(connect)
+			for _, sub := range state.SnapshotSubscriptions() {
+				s.broker.Subscribe(sub.Filter, sub.QoS, state)
+			}
 			owner := &activeConnection{client: cli, session: state, cleanSession: connect.CleanSession, done: make(chan struct{})}
 			s.clients[cli.ID()] = owner
 			s.clientsMu.Unlock()
@@ -326,8 +337,8 @@ func (s *Server) closeSession(owner *activeConnection) {
 	if s.clients[id] == owner {
 		if owner.cleanSession {
 			s.sessions.Delete(id)
+			s.broker.UnsubscribeAll(id)
 		}
-		s.broker.UnsubscribeAll(id)
 		delete(s.clients, id)
 	}
 	close(owner.done)
@@ -418,29 +429,48 @@ func (s *Server) handlePubAck(sess *session.State, p *protocol.PubAckPacket) err
 }
 
 func (s *Server) handleSubscribe(cli *client.Client, sess *session.State, p *protocol.SubscribePacket) error {
-	returnCodes := make([]byte, len(p.Subscriptions))
-
+	// Pause selection while admitting retained messages, so none can pass SUBACK.
+	sess.PauseDelivery()
+	defer sess.ResumeDelivery()
+	codes := make([]byte, len(p.Subscriptions))
+	var transient [][]byte
 	for i, sub := range p.Subscriptions {
-		grantedQoS := sub.QoS
-		if grantedQoS > 1 {
-			grantedQoS = 1
+		qos := sub.QoS
+		if qos > 1 {
+			qos = 1
 		}
-
-		sess.SetSubscription(sub.Topic, grantedQoS)
-		s.broker.Subscribe(sub.Topic, grantedQoS, cli)
-		returnCodes[i] = grantedQoS
-
-		if err := s.sendRetained(cli, sess, sub.Topic, grantedQoS); err != nil {
+		sess.SetSubscription(sub.Topic, qos)
+		s.broker.Subscribe(sub.Topic, qos, sess)
+		codes[i] = qos
+		for _, retained := range s.broker.RetainedMatching(sub.Topic) {
+			outbound := newOutboundPublish(retained, deliveryQoS(retained.QoS, qos))
+			if outbound.QoS == 1 {
+				template, err := newPublishTemplate(s.encodePublishFn, outbound)
+				if err != nil {
+					return err
+				}
+				if _, err := sess.Admit(template.raw, template.packetIDOffset); err != nil {
+					return err
+				}
+			} else {
+				raw, err := s.encodePublishFn(outbound)
+				if err != nil {
+					return err
+				}
+				transient = append(transient, raw)
+			}
+		}
+	}
+	if err := sendPacket(cli, &protocol.SubAckPacket{PacketID: p.PacketID, ReturnCodes: codes}); err != nil {
+		return err
+	}
+	for _, raw := range transient {
+		if err := cli.Enqueue(raw); err != nil {
 			return err
 		}
 	}
-
-	return sendPacket(cli, &protocol.SubAckPacket{
-		PacketID:    p.PacketID,
-		ReturnCodes: returnCodes,
-	})
+	return nil
 }
-
 func (s *Server) handleUnsubscribe(cli *client.Client, sess *session.State, p *protocol.UnsubscribePacket) error {
 	for _, filter := range p.Topics {
 		s.broker.Unsubscribe(filter, cli.ID())
@@ -463,7 +493,7 @@ func (s *Server) handlePublish(cli *client.Client, p *protocol.PublishPacket) er
 }
 
 func (s *Server) publishMessage(p *protocol.PublishPacket) error {
-	// Keep snapshot delivery and slow-client eviction within one ownership epoch.
+	// Keep snapshot admission within one session ownership lifetime.
 	// Concurrent publishers share this read lock; takeover and cleanup are writers.
 	s.clientsMu.RLock()
 	defer s.clientsMu.RUnlock()
@@ -481,103 +511,63 @@ func (s *Server) publishMessage(p *protocol.PublishPacket) error {
 	return publishErr
 }
 
-func (s *Server) sendRetained(cli *client.Client, sess *session.State, filter string, grantedQoS byte) error {
-	for _, retained := range s.broker.RetainedMatching(filter) {
-		deliveryQoS := retained.QoS
-		if grantedQoS < deliveryQoS {
-			deliveryQoS = grantedQoS
+func (s *Server) consumeDeliveries(ctx context.Context, cli *client.Client, sess *session.State, epoch uint64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cli.Done():
+			return
+		default:
 		}
-
-		outbound := &protocol.PublishPacket{
-			Topic:   retained.Topic,
-			Payload: retained.Payload,
-			Retain:  true,
-			QoS:     deliveryQoS,
+		delivery, ok := sess.Next(epoch)
+		if ok {
+			if err := cli.Send(delivery.Data); err != nil {
+				log.Printf("delivery write error: %v", err)
+				cli.Close()
+				return
+			}
+			continue
 		}
-
-		if err := s.enqueuePublish(cli, sess, outbound, nil); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (s *Server) replayInflight(cli *client.Client, sess *session.State) error {
-	for _, pub := range sess.ReplayPending() {
-		raw, err := s.encodePublishFn(pub)
-		if err != nil {
-			return err
-		}
-		if err := cli.Enqueue(raw); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return
+		case <-cli.Done():
+			return
+		case <-sess.Changed():
 		}
 	}
-
-	return nil
 }
 
 func (s *Server) deliverPublishToSubscriber(pub *protocol.PublishPacket, sub topic.Subscription, cache *publishDeliveryCache) error {
-	// publishMessage holds clientsMu while the broker walks its subscriber snapshot.
-	owner := s.clients[sub.ClientID]
-	if owner == nil || owner.closing || owner.client != sub.Subscriber {
+	// The registry read lock keeps session replacement outside this admission.
+	state, found := s.sessions.Get(sub.ClientID)
+	if !found || sub.Subscriber != state {
 		return nil
 	}
-	state := owner.session
-
-	deliveryQoS := deliveryQoS(pub.QoS, sub.QoS)
-	outbound := newOutboundPublish(pub, deliveryQoS)
-
-	if deliveryQoS == 0 {
+	qos := deliveryQoS(pub.QoS, sub.QoS)
+	outbound := newOutboundPublish(pub, qos)
+	if qos == 0 {
+		owner := s.clients[sub.ClientID]
+		if owner == nil || owner.closing || !owner.ready || owner.session != state {
+			return nil
+		}
 		raw, err := cache.qos0Payload(s.encodePublishFn, outbound)
 		if err != nil {
 			return err
 		}
-		return sub.Subscriber.Enqueue(raw)
+		if err := owner.client.Enqueue(raw); err != nil {
+			owner.client.Close()
+		}
+		return nil
 	}
-
 	template, err := cache.qos1Template(s.encodePublishFn, outbound)
 	if err != nil {
 		return err
 	}
-
-	return s.enqueuePublish(sub.Subscriber, state, outbound, template)
+	_, err = state.Admit(template.raw, template.packetIDOffset)
+	return err
 }
-
-func (s *Server) enqueuePublish(sub topic.Subscriber, sess *session.State, pub *protocol.PublishPacket, template *publishTemplate) error {
-	rawPub := pub
-	if pub.QoS == 1 {
-		tracked, err := sess.TrackOutbound(pub)
-		if err != nil {
-			return err
-		}
-		rawPub = tracked
-	}
-
-	var raw []byte
-	if template != nil {
-		raw = template.withPacketID(rawPub.PacketID)
-	} else {
-		var err error
-		raw, err = s.encodePublishFn(rawPub)
-		if err != nil {
-			if rawPub.QoS == 1 {
-				sess.Ack(rawPub.PacketID)
-			}
-			return err
-		}
-	}
-
-	if err := sub.Enqueue(raw); err != nil {
-		if rawPub.QoS == 1 {
-			sess.Ack(rawPub.PacketID)
-		}
-		return err
-	}
-
-	return nil
-}
-
 func deliveryQoS(publishQoS byte, subscriptionQoS byte) byte {
 	if subscriptionQoS < publishQoS {
 		return subscriptionQoS
@@ -627,13 +617,6 @@ func newPublishTemplate(encodeFn func(pub *protocol.PublishPacket) ([]byte, erro
 		raw:            raw,
 		packetIDOffset: publishPacketIDOffset(pub.Topic, len(pub.Payload)),
 	}, nil
-}
-
-func (t *publishTemplate) withPacketID(packetID uint16) []byte {
-	raw := append([]byte(nil), t.raw...)
-	raw[t.packetIDOffset] = byte(packetID >> 8)
-	raw[t.packetIDOffset+1] = byte(packetID)
-	return raw
 }
 
 func (c *publishDeliveryCache) qos0Payload(encodeFn func(pub *protocol.PublishPacket) ([]byte, error), pub *protocol.PublishPacket) ([]byte, error) {

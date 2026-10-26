@@ -1,0 +1,15 @@
+server:
+  address: ":1883"
+  handshake_timeout: "10s"
+  max_packet_size_bytes: 1048576
+
+sessions:
+  max_pending_messages_per_session: 1000
+  max_pending_bytes_per_session: 16777216
+  max_pending_messages_global: 100000
+  max_pending_bytes_global: 268435456
+  max_inflight_messages_per_session: 20
+
+observability:
+  summary_interval: "30s"
+  saturation_log_interval: "10s"
