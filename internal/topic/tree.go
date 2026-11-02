@@ -79,17 +79,25 @@ func PutSubs(subs []Subscription) {
 // Unsubscribe removes the subscriber with the given clientID from the node
 // matching the specific filter. Other subscriptions for the same client are left intact.
 func (t *Tree) Unsubscribe(filter string, clientID string) {
-	levels := splitFilter(filter)
+	t.root.unsubscribe(splitFilter(filter), clientID)
+}
 
-	cur := t.root
-	for _, lvl := range levels {
-		if cur.children[lvl] == nil {
-			return
-		}
-		cur = cur.children[lvl]
+func (n *node) unsubscribe(levels []string, clientID string) {
+	if n == nil {
+		return
 	}
-
-	delete(cur.subs, clientID)
+	if len(levels) == 0 {
+		delete(n.subs, clientID)
+		return
+	}
+	child := n.children[levels[0]]
+	if child == nil {
+		return
+	}
+	child.unsubscribe(levels[1:], clientID)
+	if len(child.children) == 0 && len(child.subs) == 0 {
+		delete(n.children, levels[0])
+	}
 }
 
 // UnsubscribeAll removes all subscriptions for the given clientID from the tree.
@@ -168,7 +176,10 @@ func (t *Tree) unsubscribeAll(n *node, clientID string) {
 
 	delete(n.subs, clientID)
 
-	for _, child := range n.children {
+	for level, child := range n.children {
 		t.unsubscribeAll(child, clientID)
+		if len(child.children) == 0 && len(child.subs) == 0 {
+			delete(n.children, level)
+		}
 	}
 }

@@ -41,14 +41,20 @@ func run(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(cfg.Server.Address, broker.New(), sessions,
+	b, err := broker.NewWithLimits(cfg.Retained)
+	if err != nil {
+		return err
+	}
+	srv := server.New(cfg.Server.Address, b, sessions,
 		server.WithHandshakeTimeout(cfg.Server.HandshakeTimeout),
+		server.WithWriteTimeout(cfg.Server.WriteTimeout),
+		server.WithConnectionLimits(server.ConnectionLimits{MaxConnections: cfg.Server.MaxConnections, MaxHandshakes: cfg.Server.MaxHandshakes}),
 		server.WithMaxPacketSize(cfg.Server.MaxPacketSizeBytes))
 	observeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		observation.Run(observeCtx, sessions, cfg.Observability.SummaryInterval, cfg.Observability.SaturationLogInterval, log.Default())
+		observation.Run(observeCtx, observation.Sources{Sessions: sessions, Broker: b, Server: srv}, cfg.Observability.SummaryInterval, cfg.Observability.SaturationLogInterval, log.Default())
 	}()
 	defer func() { cancel(); <-done }()
 	return srv.Start(ctx)

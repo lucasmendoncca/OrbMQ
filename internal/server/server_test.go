@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -16,9 +17,270 @@ import (
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/session"
+	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestStart_ShouldClosePublisherWithoutPubAck_WhenRetainedCapacityIsFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, err := broker.NewWithLimits(broker.RetainedLimits{MaxMessages: 1, MaxBytes: 2})
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServer(t, func(s *Server) { s.broker = b })
+		defer stop()
+		pub, _ := connectPipeClient(t, connections, "publisher")
+		defer pub.Close()
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "a", Payload: []byte("x"), Retain: true, QoS: 1, PacketID: 7})
+		assert.Equal(t, []byte{0x40, 2, 0, 7}, readPacketBytes(t, pub))
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "b", Payload: []byte("x"), Retain: true, QoS: 1, PacketID: 8})
+		_, err = pub.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+		assert.Equal(t, 2, b.Snapshot().RetainedBytes)
+		require.Len(t, b.RetainedMatching("a"), 1)
+	})
+}
+
+func TestStart_ShouldRejectInvalidResourceOptions_WhenConfigured(t *testing.T) {
+	for _, option := range []Option{WithWriteTimeout(0), WithWriteTimeout(-time.Second), WithConnectionLimits(ConnectionLimits{}), WithConnectionLimits(ConnectionLimits{MaxConnections: 1, MaxHandshakes: 2})} {
+		srv := newTestServer(option, WithListener(func(string, string) (net.Listener, error) {
+			t.Fatal("invalid limits must fail before listening")
+			return nil, nil
+		}))
+		require.Error(t, srv.Start(context.Background()))
+	}
+}
+
+func TestStart_ShouldExpireOfflineSessionsAndPreserveRetained_WhenCollectorRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.OfflineTTL, limits.CleanupInterval = time.Minute, 10*time.Second
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		srv, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		old, present := connectPersistentPipeClient(t, connections, "offline")
+		defer old.Close()
+		assert.False(t, present)
+		subscribe(t, old, 1, "session/#", 1, []byte{1})
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "session/value", Payload: []byte("pending"), QoS: 1, PacketID: 7})
+		_ = decodeClientPacket(t, publisher)
+		_ = decodeClientPacket(t, old)
+		old.Close()
+		synctest.Wait()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "retained/value", Payload: []byte("retained"), Retain: true, QoS: 1, PacketID: 8})
+		_ = decodeClientPacket(t, publisher)
+		time.Sleep(30 * time.Second)
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "session/value", Payload: []byte("offline"), QoS: 1, PacketID: 9})
+		_ = decodeClientPacket(t, publisher)
+		assert.Equal(t, 2, store.Snapshot().PendingMessages)
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		assert.Equal(t, uint64(1), store.Snapshot().ExpiredSessions)
+		assert.Zero(t, store.Snapshot().PendingMessages)
+		assert.Zero(t, store.Snapshot().PendingBytes)
+		assert.Zero(t, store.Snapshot().SubscriptionCount)
+		require.Len(t, srv.broker.RetainedMatching("retained/#"), 1)
+		require.NoError(t, srv.broker.Publish(&protocol.PublishPacket{Topic: "session/value"}, func(topic.Subscription) error {
+			t.Error("expired subscriptions must leave routing")
+			return nil
+		}))
+		replacement, present := connectPersistentPipeClient(t, connections, "offline")
+		defer replacement.Close()
+		assert.False(t, present)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		assert.Equal(t, 2, store.Snapshot().SessionCount, "online sessions must not expire")
+	})
+}
+
+func TestStart_ShouldCheckDeadlineOnReconnect_WhenCollectorHasNotRun(t *testing.T) {
+	for _, beforeExpiry := range []bool{false, true} {
+		t.Run(fmt.Sprint(beforeExpiry), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				limits := session.DefaultLimits()
+				limits.OfflineTTL, limits.CleanupInterval = time.Minute, time.Hour
+				store, err := session.NewWithLimits(limits)
+				require.NoError(t, err)
+				_, connections, stop := startPipeTestServerWithStore(t, store)
+				defer stop()
+				old, _ := connectPersistentPipeClient(t, connections, "persistent")
+				subscribe(t, old, 1, "a/#", 0, []byte{0})
+				old.Close()
+				synctest.Wait()
+				elapsed := time.Minute
+				if beforeExpiry {
+					elapsed = 30 * time.Second
+				}
+				time.Sleep(elapsed)
+				conn, present := connectPersistentPipeClient(t, connections, "persistent")
+				defer conn.Close()
+				assert.Equal(t, beforeExpiry, present)
+				time.Sleep(2 * time.Hour)
+				synctest.Wait()
+				assert.Equal(t, 1, store.Snapshot().SessionCount)
+			})
+		})
+	}
+}
+
+func TestStart_ShouldPreservePendingDelivery_WhenWriteTimesOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := session.New()
+		_, connections, stop := startPipeTestServerWithStore(t, store, WithWriteTimeout(time.Second))
+		defer stop()
+		sub, _ := connectPersistentPipeClient(t, connections, "slow")
+		defer sub.Close()
+		subscribe(t, sub, 1, "a/#", 1, []byte{1})
+		pub, _ := connectPipeClient(t, connections, "publisher")
+		defer pub.Close()
+		writePublish(t, pub, &protocol.PublishPacket{Topic: "a/value", Payload: []byte("pending"), QoS: 1, PacketID: 7})
+		_ = decodeClientPacket(t, pub)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		_, err := sub.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+		assert.Equal(t, 1, store.Snapshot().PendingMessages)
+		replacement, present := connectPersistentPipeClient(t, connections, "slow")
+		defer replacement.Close()
+		assert.True(t, present)
+		delivery := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
+		assert.Equal(t, []byte("pending"), delivery.Payload)
+		assert.True(t, delivery.DUP)
+		writePubAck(t, replacement, delivery.PacketID)
+		_, err = replacement.Write([]byte{0xC0, 0})
+		require.NoError(t, err)
+		_ = readPacketBytes(t, replacement)
+		assert.Zero(t, store.Snapshot().PendingMessages)
+	})
+}
+
+func TestStart_ShouldRejectSubscriptionEntriesIndividually_WhenBudgetsAreFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxSubscriptionsPerSession, limits.MaxSubscriptionsGlobal = 1, 1
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		conn, _ := connectPipeClient(t, connections, "subscriber")
+		defer conn.Close()
+		_, err = conn.Write([]byte{0x82, 14, 0, 1, 0, 3, 'a', '/', '+', 0, 0, 3, 'b', '/', '+', 0})
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0x90, 4, 0, 1, 0, 0x80}, readPacketBytes(t, conn))
+		subscribe(t, conn, 2, "a/+", 1, []byte{1})
+		other, _ := connectPipeClient(t, connections, "other")
+		defer other.Close()
+		subscribe(t, other, 3, "b/#", 0, []byte{0x80})
+		_, err = conn.Write(encodeUnsubscribePacketForTest(t, 4, "a/+"))
+		require.NoError(t, err)
+		_ = readPacketBytes(t, conn)
+		subscribe(t, other, 5, "b/#", 0, []byte{0})
+		assert.Equal(t, 1, store.Snapshot().SubscriptionCount)
+	})
+}
+
+func TestStart_ShouldRejectNewSessionButResumeExisting_WhenSessionCapacityIsFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limits := session.DefaultLimits()
+		limits.MaxSessions = 1
+		store, err := session.NewWithLimits(limits)
+		require.NoError(t, err)
+		_, connections, stop := startPipeTestServerWithStore(t, store)
+		defer stop()
+		old, _ := connectPersistentPipeClient(t, connections, "existing")
+		old.Close()
+		synctest.Wait()
+		serverConn, rejected := net.Pipe()
+		defer rejected.Close()
+		connections <- serverConn
+		_, err = rejected.Write(encodeConnectPacket(t, connectOptions{clientID: "new", cleanSession: true}))
+		require.NoError(t, err)
+		_, err = rejected.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF)
+		conn, present := connectPersistentPipeClient(t, connections, "existing")
+		defer conn.Close()
+		assert.True(t, present)
+		assert.Equal(t, uint64(1), store.Snapshot().SessionRejections)
+	})
+}
+
+func TestStart_ShouldWriteSubAckBeforeEncodingRetained_WhenSubscriptionIsAccepted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := make(chan struct{})
+		release := sync.OnceFunc(func() { close(gate) })
+		_, connections, stop := startPipeTestServer(t, WithPublishEncoder(func(pub *protocol.PublishPacket) ([]byte, error) {
+			if pub.Retain {
+				<-gate
+			}
+			return encodePublishPacket(pub)
+		}))
+		defer stop()
+		defer release()
+		publisher, _ := connectPipeClient(t, connections, "publisher")
+		defer publisher.Close()
+		writePublish(t, publisher, &protocol.PublishPacket{Topic: "retained/value", Payload: []byte("value"), QoS: 1, PacketID: 7, Retain: true})
+		_ = decodeClientPacket(t, publisher)
+		sub, observed := connectPipeClient(t, connections, "subscriber")
+		defer sub.Close()
+		_, err := sub.Write(encodeSubscribePacket(t, 1, "retained/#", 0))
+		require.NoError(t, err)
+		synctest.Wait()
+		assert.Equal(t, int32(1), observed.writing.Load(), "SUBACK must be written before retaining encoded delivery batches")
+		release()
+		assert.Equal(t, []byte{0x90, 3, 0, 1, 0}, readPacketBytes(t, sub))
+		pub := decodeClientPacket(t, sub).(*protocol.PublishPacket)
+		assert.Equal(t, []byte("value"), pub.Payload)
+		assert.True(t, pub.Retain)
+	})
+}
+
+func TestStart_ShouldRejectExcessConnectionsAndReuseCapacity_WhenLimitsAreReached(t *testing.T) {
+	for _, handshakeFull := range []bool{false, true} {
+		t.Run(fmt.Sprint(handshakeFull), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				limits := DefaultConnectionLimits()
+				limits.MaxConnections, limits.MaxHandshakes = 1, 1
+				if handshakeFull {
+					limits.MaxConnections = 2
+				}
+				srv, connections, stop := startPipeTestServer(t, WithConnectionLimits(limits))
+				defer stop()
+				firstServer, first := net.Pipe()
+				defer first.Close()
+				connections <- firstServer
+				if !handshakeFull {
+					_, err := first.Write(encodeConnectPacket(t, connectOptions{clientID: "first", cleanSession: true}))
+					require.NoError(t, err)
+					readConnAck(t, first)
+				}
+				rejectedServer, rejected := net.Pipe()
+				defer rejected.Close()
+				connections <- rejectedServer
+				synctest.Wait()
+				_, err := rejected.Read(make([]byte, 1))
+				require.ErrorIs(t, err, io.EOF)
+				if handshakeFull {
+					assert.Equal(t, uint64(1), srv.Snapshot().HandshakeRejections)
+					_, err := first.Write(encodeConnectPacket(t, connectOptions{clientID: "first", cleanSession: true}))
+					require.NoError(t, err)
+					readConnAck(t, first)
+				} else {
+					assert.Equal(t, uint64(1), srv.Snapshot().ConnectionRejections)
+					first.Close()
+				}
+				synctest.Wait()
+				assert.Zero(t, srv.Snapshot().Handshakes)
+				next, _ := connectPipeClient(t, connections, "next")
+				defer next.Close()
+				_, err = next.Write([]byte{0xC0, 0x00})
+				require.NoError(t, err)
+				assert.Equal(t, []byte{0xD0, 0x00}, readPacketBytes(t, next))
+			})
+		})
+	}
+}
 
 func TestStart_ShouldEnforcePacketSize_WhenConfiguredLimitIsExceeded(t *testing.T) {
 	for _, tc := range []struct {
@@ -410,7 +672,7 @@ func TestStart_ShouldRecoverOfflineAndConcurrentDeliveries_WhenSessionReconnects
 	synctest.Test(t, func(t *testing.T) {
 		_, connections, stop := startPipeTestServer(t)
 		defer stop()
-		old := connectPersistentPipeClient(t, connections, "persistent")
+		old, _ := connectPersistentPipeClient(t, connections, "persistent")
 		subscribe(t, old, 1, "sensors/#", 1, []byte{1})
 		publisher, _ := connectPipeClient(t, connections, "publisher")
 		defer publisher.Close()
@@ -459,7 +721,7 @@ func TestStart_ShouldIsolateSaturation_WhenPersistentSubscriberIsOffline(t *test
 		require.NoError(t, err)
 		_, connections, stop := startPipeTestServerWithStore(t, store)
 		defer stop()
-		slow := connectPersistentPipeClient(t, connections, "offline")
+		slow, _ := connectPersistentPipeClient(t, connections, "offline")
 		subscribe(t, slow, 1, "sensors/#", 1, []byte{1})
 		writeDisconnect(t, slow)
 		require.NoError(t, slow.Close())
@@ -480,7 +742,7 @@ func TestStart_ShouldIsolateSaturation_WhenPersistentSubscriberIsOffline(t *test
 		stats := store.Snapshot()
 		assert.Equal(t, uint64(2), stats.SessionLimitDrops)
 		assert.Equal(t, 1, stats.PendingMessages)
-		reconnected := connectPersistentPipeClient(t, connections, "offline")
+		reconnected, _ := connectPersistentPipeClient(t, connections, "offline")
 		defer reconnected.Close()
 		pub := decodeClientPacket(t, reconnected).(*protocol.PublishPacket)
 		assert.Equal(t, []byte{0}, pub.Payload, "oldest accepted delivery must survive")
@@ -495,7 +757,7 @@ func TestStart_ShouldPreserveUnwrittenDelivery_WhenConnectionFailsDuringSend(t *
 	synctest.Test(t, func(t *testing.T) {
 		_, connections, stop := startPipeTestServer(t)
 		defer stop()
-		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		conn, _ := connectPersistentPipeClient(t, connections, "subscriber")
 		subscribe(t, conn, 1, "sensors/#", 1, []byte{1})
 		publisher, _ := connectPipeClient(t, connections, "publisher")
 		defer publisher.Close()
@@ -504,7 +766,7 @@ func TestStart_ShouldPreserveUnwrittenDelivery_WhenConnectionFailsDuringSend(t *
 		synctest.Wait()
 		require.NoError(t, conn.Close())
 		synctest.Wait()
-		replacement := connectPersistentPipeClient(t, connections, "subscriber")
+		replacement, _ := connectPersistentPipeClient(t, connections, "subscriber")
 		defer replacement.Close()
 		pub := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
 		assert.Equal(t, []byte("blocked"), pub.Payload)
@@ -520,7 +782,7 @@ func TestStart_ShouldPreserveAcceptedDeliveries_WhenSubscriptionIsRemoved(t *tes
 		require.NoError(t, err)
 		_, connections, stop := startPipeTestServerWithStore(t, store)
 		defer stop()
-		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		conn, _ := connectPersistentPipeClient(t, connections, "subscriber")
 		defer conn.Close()
 		subscribe(t, conn, 1, "sensors/#", 1, []byte{1})
 		publisher, _ := connectPipeClient(t, connections, "publisher")
@@ -582,11 +844,12 @@ func TestStart_ShouldDrainBacklogGradually_WhenQueueExceedsTransportCapacity(t *
 		require.NoError(t, err)
 		_, connections, stop := startPipeTestServerWithStore(t, store)
 		defer stop()
-		state, _ := store.GetOrCreate("persistent")
+		state, _, sessionErr := store.GetOrCreate("persistent")
+		require.NoError(t, sessionErr)
 		for range 1026 {
 			admitForTest(t, state, "pending")
 		}
-		conn := connectPersistentPipeClient(t, connections, "persistent")
+		conn, _ := connectPersistentPipeClient(t, connections, "persistent")
 		defer conn.Close()
 		for range 1026 {
 			packet := decodeClientPacket(t, conn)
@@ -982,10 +1245,11 @@ func TestStart_ShouldKeepInflightWindowBounded_WhenSubscriberDoesNotAcknowledge(
 		require.NoError(t, err)
 		_, connections, stop := startPipeTestServerWithStore(t, store)
 		defer stop()
-		state, _ := store.GetOrCreate("persistent")
+		state, _, sessionErr := store.GetOrCreate("persistent")
+		require.NoError(t, sessionErr)
 		admitForTest(t, state, "first")
 		admitForTest(t, state, "second")
-		conn := connectPersistentPipeClient(t, connections, "persistent")
+		conn, _ := connectPersistentPipeClient(t, connections, "persistent")
 		defer conn.Close()
 		first := decodeClientPacket(t, conn).(*protocol.PublishPacket)
 		assertNoPacket(t, conn)
@@ -998,7 +1262,7 @@ func TestStart_ShouldKeepInflightWindowBounded_WhenSubscriberDoesNotAcknowledge(
 		assert.Equal(t, []byte("second"), second.Payload)
 		require.NoError(t, conn.Close())
 		synctest.Wait()
-		replacement := connectPersistentPipeClient(t, connections, "persistent")
+		replacement, _ := connectPersistentPipeClient(t, connections, "persistent")
 		defer replacement.Close()
 		replay := decodeClientPacket(t, replacement).(*protocol.PublishPacket)
 		assert.True(t, replay.DUP)
@@ -1142,7 +1406,7 @@ func TestStart_ShouldAcknowledgeSubscription_WhenRetainedDeliveryExceedsCapacity
 			writePublish(t, publisher, &protocol.PublishPacket{Topic: name, Payload: []byte("value"), Retain: true, QoS: 1, PacketID: uint16(i + 1)})
 			_ = decodeClientPacket(t, publisher)
 		}
-		conn := connectPersistentPipeClient(t, connections, "subscriber")
+		conn, _ := connectPersistentPipeClient(t, connections, "subscriber")
 		defer conn.Close()
 		subscribe(t, conn, 1, "retained/#", 1, []byte{1})
 		pub := decodeClientPacket(t, conn).(*protocol.PublishPacket)
@@ -1816,13 +2080,12 @@ func admitForTest(t *testing.T, state *session.State, payload string) {
 	require.Empty(t, reason)
 }
 
-func connectPersistentPipeClient(t *testing.T, connections chan<- net.Conn, id string) net.Conn {
+func connectPersistentPipeClient(t *testing.T, connections chan<- net.Conn, id string) (net.Conn, bool) {
 	t.Helper()
 	serverConn, conn := net.Pipe()
 	connections <- serverConn
 	setDeadline(t, conn)
 	_, err := conn.Write(encodeConnectPacket(t, connectOptions{clientID: id}))
 	require.NoError(t, err)
-	readConnAck(t, conn)
-	return conn
+	return conn, readConnAck(t, conn)
 }

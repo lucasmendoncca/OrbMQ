@@ -38,7 +38,6 @@ Not implemented yet as complete broker capabilities:
 
 - MQTT 5 support
 - durable session storage across process restarts
-- session expiry
 - QoS 2 flows
 - TLS, authentication, and authorization
 - clustering
@@ -124,6 +123,7 @@ Some notable implementation choices in the current broker:
   - the broker depends on an interface instead of a concrete client type
 - **Connection lifecycle and ownership**
   - CONNECT parsing and the initial CONNACK write have a 10-second deadline, configurable with `server.WithHandshakeTimeout`
+  - each write has a fresh 30-second deadline by default, configurable with `server.WithWriteTimeout`; CONNACK also keeps the absolute handshake deadline
   - cancellation closes the listener and all connections, including incomplete handshakes; `Start` waits for connection handlers and writers to exit
   - shutdown interrupts pending writes rather than draining queues; persistent in-memory sessions retain unacknowledged QoS 1 messages
   - replacing a Client ID closes its previous connection and waits for its cleanup before opening the new session
@@ -154,20 +154,68 @@ The root `config.yaml` configures the listening address, handshake timeout,
 incoming packet limit, session budgets and observation intervals. Missing fields
 use documented defaults; a missing file, unknown fields, nulls, aliases, multiple
 documents or invalid values stop startup. Byte limits use integer bytes and
-durations use strings such as `10s`. All limits and intervals must be positive.
+durations use strings such as `10s`. All limits and intervals must be positive,
+except `sessions.offline_ttl`, where `0s` disables expiry (the default).
 
 | Resource | Per session | Global |
 |---|---:|---:|
 | Pending QoS 1 deliveries | 1,000 | 100,000 |
 | Pending encoded bytes | 16 MiB | 256 MiB |
 | Deliveries awaiting PUBACK | 20 | Included in global budgets |
+| Stored sessions, including empty sessions | — | 10,000 |
+| Subscriptions | 1,000 | 100,000 |
+| Open connections, including handshakes | — | 10,000 |
+| Concurrent handshakes, through CONNACK | — | 1,000 |
+| Retained topics | — | 10,000 |
+| Retained topic and payload bytes | — | 64 MiB |
+
+Filters are limited to 4,096 UTF-8 bytes and 64 levels, including empty levels.
+Updating an existing subscription does not consume another slot. Unsubscribe,
+clean session deletion and expiry release subscription capacity and prune empty
+routing branches. These defaults are starting policies, not measured sizing
+guarantees; tune them in `config.yaml` for the deployment.
+
+Connection and handshake saturation close only the newly accepted socket before
+starting another handler. A full session store closes a connection requesting a
+new session before CONNACK; existing sessions can reconnect without another
+session slot, provided connection/handshake capacity is available. Subscription
+admission is independent per entry: SUBACK returns `0x80` for refused entries,
+and accepted subscriptions remain intact. Refused entries do not replay retained
+messages. Retained matches are processed one filter at a time after SUBACK,
+avoiding an accumulated batch of copies across all requested filters.
+
+Retained accounting includes stored topic-name bytes and payload bytes, not map
+overhead. Replacement charges the size difference, and an empty retained payload
+always removes its topic, even at capacity. An update that exceeds a retained
+budget preserves the previous value and is rejected before live fan-out; the
+publisher connection closes without PUBACK for that QoS 1 publication. No existing
+retained message is evicted to make room. Retained Will rejection is counted too.
+
+### Offline session expiry
+
+Set `sessions.offline_ttl` to a positive duration such as `24h` to enable the local
+expiry policy. The deadline starts when the connection begins closing; cleanup
+must finish before the session can be collected. Messages arriving while offline
+do not renew the deadline. Reconnecting before expiry clears the offline timer;
+connected sessions never expire. Reconnecting after the deadline opens a fresh
+session even if the periodic sweep has not run yet.
+
+A single collector runs at `sessions.cleanup_interval` (default `1m`) when expiry
+is enabled and is joined during shutdown. It rechecks offline state under the
+same ownership coordination as reconnect, then removes expired sessions,
+subscriptions and pending deliveries, releasing their budgets once. Retained
+messages are independent and are not removed by session expiry. This is a local
+retention policy, not MQTT 5 negotiated Session Expiry.
+
+### Delivery capacity and observation
 
 Pending totals include unsent and unacknowledged deliveries, including connected
 clean sessions. Each destination is charged the complete encoded PUBLISH size;
 shared payloads do not reduce the logical charge. Counters are released once on
 PUBACK or session deletion, not when moving messages into the transport queue.
 These are not process memory limits: retained messages, connections, session
-metadata and transport copies consume additional memory. Sessions have no expiry.
+metadata and transport copies consume additional memory. Offline expiry is
+disabled unless explicitly configured.
 
 If a local or global budget is exhausted, new deliveries that do not fit are
 dropped. Existing deliveries and subscriptions remain intact, and publishers
@@ -178,7 +226,10 @@ precedence when recording the reason. QoS 1 therefore does not promise absence
 of loss under capacity exhaustion. QoS 0 is never queued offline.
 
 `Store.Snapshot` and `State.Snapshot` expose occupancy, inflight counts, drop
-counters and oldest pending age. Aggregate summaries are logged every 30 seconds;
+counters and oldest pending age. Server and broker snapshots additionally expose
+connection/handshake occupancy and refusals, and retained occupancy and refusals.
+Store snapshots include session/subscription counts, refusals and expired-session
+totals. Aggregate summaries are logged every 30 seconds;
 saturation deltas are aggregated once per reason every 10 seconds. Both intervals
 are configurable. There is no HTTP metrics endpoint or Client ID metric label.
 
@@ -236,7 +287,7 @@ go test -run='^$' -bench=. -benchmem ./internal/broker/...
 Planned evolution areas include:
 
 - full MQTT 5 protocol support
-- durable session storage and session expiry
+- durable session storage
 - QoS 2 support
 - TLS, authentication, and authorization
 - metrics and observability

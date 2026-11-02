@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"errors"
 	"maps"
 	"sync"
 	"sync/atomic"
@@ -15,13 +16,53 @@ type Broker struct {
 	topics     atomic.Value
 	retainedMu sync.Mutex
 	retained   atomic.Value
+	limits     RetainedLimits
+	stats      Snapshot
+}
+
+var ErrRetainedLimit = errors.New("retained limit reached")
+
+type RetainedLimits struct {
+	MaxMessages int `yaml:"max_messages"`
+	MaxBytes    int `yaml:"max_bytes"`
+}
+
+func DefaultRetainedLimits() RetainedLimits {
+	return RetainedLimits{MaxMessages: 10000, MaxBytes: 64 << 20}
+}
+
+func (l RetainedLimits) Validate() error {
+	if l.MaxMessages <= 0 || l.MaxBytes <= 0 {
+		return errors.New("retained limits must be positive")
+	}
+	return nil
+}
+
+type Snapshot struct {
+	RetainedMessages   int
+	RetainedBytes      int
+	RetainedRejections uint64
+}
+
+func (b *Broker) Snapshot() Snapshot {
+	b.retainedMu.Lock()
+	defer b.retainedMu.Unlock()
+	return b.stats
 }
 
 func New() *Broker {
-	b := &Broker{}
+	b, _ := NewWithLimits(DefaultRetainedLimits())
+	return b
+}
+
+func NewWithLimits(limits RetainedLimits) (*Broker, error) {
+	if err := limits.Validate(); err != nil {
+		return nil, err
+	}
+	b := &Broker{limits: limits}
 	b.topics.Store(topic.NewTree())
 	b.retained.Store(make(map[string]*protocol.PublishPacket))
-	return b
+	return b, nil
 }
 
 // Subscribe adds a client subscription to the broker.
@@ -43,9 +84,11 @@ func (b *Broker) Subscribe(filter string, qos byte, sub topic.Subscriber) {
 
 // Publish sends a message to all clients subscribed to topics that match the
 // given PublishPacket's topic name.
-func (b *Broker) Publish(pub *protocol.PublishPacket, deliver func(topic.Subscription) error) {
+func (b *Broker) Publish(pub *protocol.PublishPacket, deliver func(topic.Subscription) error) error {
 	if pub.Retain {
-		b.updateRetained(pub)
+		if err := b.updateRetained(pub); err != nil {
+			return err
+		}
 	}
 
 	tree := b.topics.Load().(*topic.Tree)
@@ -56,6 +99,7 @@ func (b *Broker) Publish(pub *protocol.PublishPacket, deliver func(topic.Subscri
 	}
 
 	topic.PutSubs(subs)
+	return nil
 }
 
 // Unsubscribe removes the client's subscription for the given filter only.
@@ -101,11 +145,23 @@ func (b *Broker) RetainedMatching(filter string) []*protocol.PublishPacket {
 	return matches
 }
 
-func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
+func (b *Broker) updateRetained(pub *protocol.PublishPacket) error {
 	b.retainedMu.Lock()
 	defer b.retainedMu.Unlock()
 
 	oldMap := b.retained.Load().(map[string]*protocol.PublishPacket)
+	oldBytes := 0
+	if old := oldMap[pub.Topic]; old != nil {
+		oldBytes = len(old.Topic) + len(old.Payload)
+	}
+	newBytes := 0
+	if len(pub.Payload) > 0 {
+		newBytes = len(pub.Topic) + len(pub.Payload)
+		if (oldMap[pub.Topic] == nil && len(oldMap) >= b.limits.MaxMessages) || newBytes > b.limits.MaxBytes-(b.stats.RetainedBytes-oldBytes) {
+			b.stats.RetainedRejections++
+			return ErrRetainedLimit
+		}
+	}
 
 	newMap := make(map[string]*protocol.PublishPacket, len(oldMap))
 	maps.Copy(newMap, oldMap)
@@ -121,4 +177,7 @@ func (b *Broker) updateRetained(pub *protocol.PublishPacket) {
 	}
 
 	b.retained.Store(newMap)
+	b.stats.RetainedMessages = len(newMap)
+	b.stats.RetainedBytes += newBytes - oldBytes
+	return nil
 }

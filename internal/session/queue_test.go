@@ -17,7 +17,8 @@ func TestStateAdmit_ShouldEnforceByteLimitsAndPrecedence_WhenBudgetsAreFull(t *t
 	limits.MaxPendingBytesGlobal = 8
 	store, err := NewWithLimits(limits)
 	require.NoError(t, err)
-	state, _ := store.GetOrCreate("client")
+	state, _, sessionErr := store.GetOrCreate("client")
+	require.NoError(t, sessionErr)
 	raw := []byte{0x32, 6, 0, 1, 'a', 0, 1, 'x'}
 	reason, err := state.Admit(raw, 5)
 	require.NoError(t, err)
@@ -25,7 +26,8 @@ func TestStateAdmit_ShouldEnforceByteLimitsAndPrecedence_WhenBudgetsAreFull(t *t
 	reason, err = state.Admit(raw, 5)
 	require.NoError(t, err)
 	assert.Equal(t, SessionLimit, reason)
-	other, _ := store.GetOrCreate("other")
+	other, _, sessionErr := store.GetOrCreate("other")
+	require.NoError(t, sessionErr)
 	reason, err = other.Admit(raw, 5)
 	require.NoError(t, err)
 	assert.Equal(t, GlobalLimit, reason)
@@ -76,7 +78,8 @@ func TestStateAdmit_ShouldReserveCapacityAtomically_WhenSessionsPublishConcurren
 		require.NoError(t, err)
 		var wg sync.WaitGroup
 		for i := range 10 {
-			state, _ := store.GetOrCreate(string(rune('a' + i)))
+			state, _, sessionErr := store.GetOrCreate(string(rune('a' + i)))
+			require.NoError(t, sessionErr)
 			wg.Go(func() { _, err := state.Admit([]byte{0x32, 6, 0, 1, 'a', 0, 1, 'x'}, 5); assert.NoError(t, err) })
 		}
 		wg.Wait()
@@ -148,7 +151,8 @@ func TestStateAdmit_ShouldPreservePendingMessages_WhenSessionLimitIsReached(t *t
 	limits.MaxInflightMessagesPerSession = 1
 	store, err := NewWithLimits(limits)
 	require.NoError(t, err)
-	state, _ := store.GetOrCreate("client")
+	state, _, sessionErr := store.GetOrCreate("client")
+	require.NoError(t, sessionErr)
 	raw := []byte{0x32, 6, 0, 1, 'a', 0, 1, 'x'}
 	for range 2 {
 		reason, err := state.Admit(raw, 5)

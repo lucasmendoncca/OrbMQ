@@ -31,23 +31,75 @@ type Server struct {
 	encodePublishFn  func(pub *protocol.PublishPacket) ([]byte, error)
 	handshakeTimeout time.Duration
 	maxPacketSize    int
+	writeTimeout     time.Duration
+	connectionLimits ConnectionLimits
+	connections      *connectionGroup
 	clientsMu        sync.RWMutex
 	clients          map[string]*activeConnection
 }
 
 type activeConnection struct {
-	client       *client.Client
-	session      *session.State
-	cleanSession bool
-	closing      bool
-	ready        bool
-	done         chan struct{}
+	client         *client.Client
+	session        *session.State
+	cleanSession   bool
+	closing        bool
+	ready          bool
+	disconnectedAt time.Time
+	done           chan struct{}
+}
+
+// beginClosing is called under clientsMu and records the first closing event.
+func (c *activeConnection) beginClosing() {
+	if !c.closing {
+		c.closing = true
+		c.disconnectedAt = time.Now()
+	}
 }
 
 type connectionGroup struct {
 	mu          sync.Mutex
-	connections map[net.Conn]struct{}
+	connections map[net.Conn]bool
 	handlers    sync.WaitGroup
+	stats       Snapshot
+}
+
+type ConnectionLimits struct {
+	MaxConnections int
+	MaxHandshakes  int
+}
+
+func DefaultConnectionLimits() ConnectionLimits {
+	return ConnectionLimits{MaxConnections: 10000, MaxHandshakes: 1000}
+}
+
+func (l ConnectionLimits) Validate() error {
+	if l.MaxConnections <= 0 || l.MaxHandshakes <= 0 || l.MaxHandshakes > l.MaxConnections {
+		return errors.New("invalid connection limits")
+	}
+	return nil
+}
+
+type Snapshot struct {
+	Connections          int
+	Handshakes           int
+	ConnectionRejections uint64
+	HandshakeRejections  uint64
+}
+
+func (s *Server) Snapshot() Snapshot {
+	s.connections.mu.Lock()
+	defer s.connections.mu.Unlock()
+	stats := s.connections.stats
+	stats.Connections = len(s.connections.connections)
+	return stats
+}
+
+func WithConnectionLimits(limits ConnectionLimits) Option {
+	return func(s *Server) { s.connectionLimits = limits }
+}
+
+func WithWriteTimeout(timeout time.Duration) Option {
+	return func(s *Server) { s.writeTimeout = timeout }
 }
 
 type publishTemplate struct {
@@ -76,6 +128,9 @@ func New(addr string, b *broker.Broker, sessions *session.Store, opts ...Option)
 		handshakeTimeout: 10 * time.Second,
 		maxPacketSize:    1 << 20,
 		clients:          make(map[string]*activeConnection),
+		writeTimeout:     30 * time.Second,
+		connectionLimits: DefaultConnectionLimits(),
+		connections:      &connectionGroup{connections: make(map[net.Conn]bool)},
 	}
 
 	for _, opt := range opts {
@@ -110,6 +165,12 @@ func WithMaxPacketSize(size int) Option {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	if err := s.connectionLimits.Validate(); err != nil {
+		return err
+	}
+	if s.writeTimeout <= 0 {
+		return errors.New("write timeout must be positive")
+	}
 	if s.maxPacketSize <= 0 || s.maxPacketSize > protocol.MaxPacketSize {
 		return errors.New("invalid maximum packet size")
 	}
@@ -121,7 +182,8 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	connections := &connectionGroup{connections: make(map[net.Conn]struct{})}
+	expiryDone := s.startSessionExpiry(runCtx)
+	connections := s.connections
 	shutdownDone := make(chan struct{})
 	context.AfterFunc(runCtx, func() {
 		defer close(shutdownDone)
@@ -131,6 +193,7 @@ func (s *Server) Start(ctx context.Context) error {
 	defer func() {
 		cancel()
 		<-shutdownDone
+		<-expiryDone
 		connections.wait()
 	}()
 
@@ -153,32 +216,55 @@ func (s *Server) acceptConnections(ctx, runCtx context.Context, ln net.Listener,
 			return fmt.Errorf("accept connection: %w", err)
 		}
 
-		if !connections.start(ctx, conn, func() { s.handleConn(runCtx, conn) }) {
+		if !connections.start(ctx, conn, s.connectionLimits, func() { s.handleConn(runCtx, conn) }) {
 			return nil
 		}
 	}
 }
 
-func (g *connectionGroup) start(ctx context.Context, conn net.Conn, handle func()) bool {
+func (g *connectionGroup) start(ctx context.Context, conn net.Conn, limits ConnectionLimits, handle func()) bool {
 	g.mu.Lock()
 	if ctx.Err() != nil {
 		g.mu.Unlock()
 		_ = conn.Close()
 		return false
 	}
-	g.connections[conn] = struct{}{}
+	if len(g.connections) >= limits.MaxConnections || g.stats.Handshakes >= limits.MaxHandshakes {
+		if len(g.connections) >= limits.MaxConnections {
+			g.stats.ConnectionRejections++
+		} else {
+			g.stats.HandshakeRejections++
+		}
+		g.mu.Unlock()
+		_ = conn.Close()
+		return true
+	}
+	g.connections[conn] = true
+	g.stats.Handshakes++
 	g.handlers.Add(1)
 	g.mu.Unlock()
 	go func() {
 		defer g.handlers.Done()
 		defer func() {
 			g.mu.Lock()
+			if g.connections[conn] {
+				g.stats.Handshakes--
+			}
 			delete(g.connections, conn)
 			g.mu.Unlock()
 		}()
 		handle()
 	}()
 	return true
+}
+
+func (g *connectionGroup) completeHandshake(conn net.Conn) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.connections[conn] {
+		g.connections[conn] = false
+		g.stats.Handshakes--
+	}
 }
 
 func (g *connectionGroup) closeAll() {
@@ -198,7 +284,8 @@ func (g *connectionGroup) wait() {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	if err := conn.SetDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
+	handshakeDeadline := time.Now().Add(s.handshakeTimeout)
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
 		_ = conn.Close()
 		return
 	}
@@ -213,7 +300,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer func() {
 		if owner != nil {
 			s.clientsMu.Lock()
-			owner.closing = true
+			owner.beginClosing()
 			s.clientsMu.Unlock()
 		}
 		cli.Close()
@@ -231,14 +318,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	sess := owner.session
+	if err := cli.SetWriteTimeout(s.writeTimeout); err != nil {
+		return
+	}
 
 	log.Printf("client connected: %s (cleanSession=%v, sessionPresent=%v)",
 		cli.ID(), connect.CleanSession, sessionPresent)
 
-	if err := sendPacket(cli, &protocol.ConnAckPacket{
+	if err := sendPacketWithDeadline(cli, &protocol.ConnAckPacket{
 		SessionPresent: sessionPresent,
 		ReturnCode:     protocol.ConnAckAccepted,
-	}); err != nil {
+	}, handshakeDeadline); err != nil {
 		log.Printf("connack error: %v", err)
 		return
 	}
@@ -246,6 +336,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		log.Printf("clear handshake deadline: %v", err)
 		return
 	}
+	s.connections.completeHandshake(conn)
 
 	s.clientsMu.Lock()
 	owner.ready = true
@@ -287,12 +378,13 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.Conne
 }
 
 // openSession restores a persistent session or creates a clean one.
-func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, bool) {
+func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, bool, error) {
+	if s.sessions.ExpireSession(connect.ClientID, time.Now()) {
+		s.broker.UnsubscribeAll(connect.ClientID)
+	}
 	if connect.CleanSession {
 		s.broker.UnsubscribeAll(connect.ClientID)
 		s.sessions.Delete(connect.ClientID)
-		state, _ := s.sessions.GetOrCreate(connect.ClientID)
-		return state, false
 	}
 
 	return s.sessions.GetOrCreate(connect.ClientID)
@@ -309,7 +401,12 @@ func (s *Server) acquireConnection(ctx context.Context, connect *protocol.Connec
 		}
 		previous := s.clients[cli.ID()]
 		if previous == nil {
-			state, present := s.openSession(connect)
+			state, present, err := s.openSession(connect)
+			if err != nil {
+				s.clientsMu.Unlock()
+				return nil, false, err
+			}
+			state.MarkConnected()
 			for _, sub := range state.SnapshotSubscriptions() {
 				s.broker.Subscribe(sub.Filter, sub.QoS, state)
 			}
@@ -318,7 +415,7 @@ func (s *Server) acquireConnection(ctx context.Context, connect *protocol.Connec
 			s.clientsMu.Unlock()
 			return owner, present, nil
 		}
-		previous.closing = true
+		previous.beginClosing()
 		s.clientsMu.Unlock()
 		previous.client.Close()
 		select {
@@ -338,10 +435,39 @@ func (s *Server) closeSession(owner *activeConnection) {
 		if owner.cleanSession {
 			s.sessions.Delete(id)
 			s.broker.UnsubscribeAll(id)
+		} else {
+			owner.session.MarkDisconnectedAt(owner.disconnectedAt)
 		}
 		delete(s.clients, id)
 	}
 	close(owner.done)
+}
+
+func (s *Server) startSessionExpiry(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	limits := s.sessions.Limits()
+	if limits.OfflineTTL == 0 {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(limits.CleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				s.clientsMu.Lock()
+				for _, id := range s.sessions.Expire(now) {
+					s.broker.UnsubscribeAll(id)
+				}
+				s.clientsMu.Unlock()
+			}
+		}
+	}()
+	return done
 }
 
 // serve runs the main packet loop. Returns true if the client disconnected
@@ -412,11 +538,15 @@ func (s *Server) publishWill(will *protocol.WillMessage) {
 }
 
 func sendPacket(cli *client.Client, pkt protocol.Packet) error {
+	return sendPacketWithDeadline(cli, pkt, time.Time{})
+}
+
+func sendPacketWithDeadline(cli *client.Client, pkt protocol.Packet, deadline time.Time) error {
 	var buf bytes.Buffer
 	if err := protocol.Encode(&buf, pkt); err != nil {
 		return err
 	}
-	return cli.Send(buf.Bytes())
+	return cli.SendWithDeadline(buf.Bytes(), deadline)
 }
 
 func (s *Server) handlePing(cli *client.Client) error {
@@ -429,21 +559,33 @@ func (s *Server) handlePubAck(sess *session.State, p *protocol.PubAckPacket) err
 }
 
 func (s *Server) handleSubscribe(cli *client.Client, sess *session.State, p *protocol.SubscribePacket) error {
-	// Pause selection while admitting retained messages, so none can pass SUBACK.
+	// Pause selection until SUBACK and retained admission have finished.
 	sess.PauseDelivery()
 	defer sess.ResumeDelivery()
 	codes := make([]byte, len(p.Subscriptions))
-	var transient [][]byte
 	for i, sub := range p.Subscriptions {
 		qos := sub.QoS
 		if qos > 1 {
 			qos = 1
 		}
-		sess.SetSubscription(sub.Topic, qos)
+		if err := sess.SetSubscription(sub.Topic, qos); err != nil {
+			codes[i] = 0x80
+			continue
+		}
 		s.broker.Subscribe(sub.Topic, qos, sess)
 		codes[i] = qos
+	}
+	if err := sendPacket(cli, &protocol.SubAckPacket{PacketID: p.PacketID, ReturnCodes: codes}); err != nil {
+		return err
+	}
+	// Process one filter at a time after SUBACK instead of accumulating copies of
+	// every retained match across all requested filters before writing anything.
+	for i, sub := range p.Subscriptions {
+		if codes[i] == 0x80 {
+			continue
+		}
 		for _, retained := range s.broker.RetainedMatching(sub.Topic) {
-			outbound := newOutboundPublish(retained, deliveryQoS(retained.QoS, qos))
+			outbound := newOutboundPublish(retained, deliveryQoS(retained.QoS, codes[i]))
 			if outbound.QoS == 1 {
 				template, err := newPublishTemplate(s.encodePublishFn, outbound)
 				if err != nil {
@@ -457,16 +599,10 @@ func (s *Server) handleSubscribe(cli *client.Client, sess *session.State, p *pro
 				if err != nil {
 					return err
 				}
-				transient = append(transient, raw)
+				if err := cli.Enqueue(raw); err != nil {
+					return err
+				}
 			}
-		}
-	}
-	if err := sendPacket(cli, &protocol.SubAckPacket{PacketID: p.PacketID, ReturnCodes: codes}); err != nil {
-		return err
-	}
-	for _, raw := range transient {
-		if err := cli.Enqueue(raw); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -500,13 +636,16 @@ func (s *Server) publishMessage(p *protocol.PublishPacket) error {
 	cache := &publishDeliveryCache{}
 	var publishErr error
 
-	s.broker.Publish(p, func(sub topic.Subscription) error {
+	err := s.broker.Publish(p, func(sub topic.Subscription) error {
 		err := s.deliverPublishToSubscriber(p, sub, cache)
 		if err != nil {
 			publishErr = err
 		}
 		return err
 	})
+	if err != nil {
+		return err
+	}
 
 	return publishErr
 }

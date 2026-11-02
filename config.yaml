@@ -2,13 +2,27 @@ server:
   address: ":1883"
   handshake_timeout: "10s"
   max_packet_size_bytes: 1048576
+  max_connections: 10000
+  max_handshakes: 1000
+  write_timeout: "30s"
 
 sessions:
+  max_sessions: 10000
+  max_subscriptions_per_session: 1000
+  max_subscriptions_global: 100000
+  max_filter_bytes: 4096
+  max_filter_levels: 64
+  offline_ttl: "0s"
+  cleanup_interval: "1m"
   max_pending_messages_per_session: 1000
   max_pending_bytes_per_session: 16777216
   max_pending_messages_global: 100000
   max_pending_bytes_global: 268435456
   max_inflight_messages_per_session: 20
+
+retained:
+  max_messages: 10000
+  max_bytes: 67108864
 
 observability:
   summary_interval: "30s"

@@ -10,21 +10,27 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/lucasmendoncca/OrbMQ/internal/broker"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
+	"github.com/lucasmendoncca/OrbMQ/internal/server"
 	"github.com/lucasmendoncca/OrbMQ/internal/session"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server        Server         `yaml:"server"`
-	Sessions      session.Limits `yaml:"sessions"`
-	Observability Observability  `yaml:"observability"`
+	Server        Server                `yaml:"server"`
+	Sessions      session.Limits        `yaml:"sessions"`
+	Retained      broker.RetainedLimits `yaml:"retained"`
+	Observability Observability         `yaml:"observability"`
 }
 
 type Server struct {
 	Address            string        `yaml:"address"`
 	HandshakeTimeout   time.Duration `yaml:"handshake_timeout"`
 	MaxPacketSizeBytes int           `yaml:"max_packet_size_bytes"`
+	MaxConnections     int           `yaml:"max_connections"`
+	MaxHandshakes      int           `yaml:"max_handshakes"`
+	WriteTimeout       time.Duration `yaml:"write_timeout"`
 }
 
 type Observability struct {
@@ -33,7 +39,12 @@ type Observability struct {
 }
 
 func Defaults() Config {
-	return Config{Server: Server{":1883", 10 * time.Second, 1 << 20}, Sessions: session.DefaultLimits(), Observability: Observability{30 * time.Second, 10 * time.Second}}
+	limits := server.DefaultConnectionLimits()
+	return Config{
+		Server:   Server{Address: ":1883", HandshakeTimeout: 10 * time.Second, MaxPacketSizeBytes: 1 << 20, MaxConnections: limits.MaxConnections, MaxHandshakes: limits.MaxHandshakes, WriteTimeout: 30 * time.Second},
+		Sessions: session.DefaultLimits(), Retained: broker.DefaultRetainedLimits(),
+		Observability: Observability{30 * time.Second, 10 * time.Second},
+	}
 }
 
 // Load requires one YAML mapping. Unknown fields, nulls and aliases are rejected
@@ -90,6 +101,15 @@ func validateNodes(node *yaml.Node) error {
 }
 
 func (c Config) Validate() error {
+	if err := (server.ConnectionLimits{MaxConnections: c.Server.MaxConnections, MaxHandshakes: c.Server.MaxHandshakes}).Validate(); err != nil {
+		return err
+	}
+	if c.Server.WriteTimeout <= 0 {
+		return errors.New("write timeout must be positive")
+	}
+	if err := c.Retained.Validate(); err != nil {
+		return err
+	}
 	_, port, err := net.SplitHostPort(c.Server.Address)
 	if err != nil {
 		return errors.New("invalid server address")

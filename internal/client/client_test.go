@@ -12,6 +12,71 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClientSendWithDeadline_ShouldRespectAbsoluteLimit_WhenPacketWaitsInQueue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer peer.Close()
+		cli := New("writer", conn)
+		defer cli.Close()
+		require.NoError(t, cli.Enqueue([]byte("first")))
+		result := make(chan error, 1)
+		deadline := time.Now().Add(time.Second)
+		go func() { result <- cli.SendWithDeadline([]byte("expired"), deadline) }()
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		_, err := io.ReadFull(peer, make([]byte, 5))
+		require.NoError(t, err)
+		synctest.Wait()
+		select {
+		case err := <-result:
+			require.Error(t, err)
+		default:
+			t.Error("queueing must not extend an absolute deadline")
+		}
+	})
+}
+
+func TestClientSetWriteTimeout_ShouldResetDeadlineForEachPacket_WhenConfigured(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer peer.Close()
+		cli := New("writer", conn)
+		defer cli.Close()
+		require.Error(t, cli.SetWriteTimeout(0))
+		require.Error(t, cli.SetWriteTimeout(-time.Second))
+		require.NoError(t, cli.SetWriteTimeout(time.Second))
+		for range 2 {
+			result := make(chan error, 1)
+			go func() { result <- cli.Send([]byte("ok")) }()
+			data := make([]byte, 2)
+			_, err := io.ReadFull(peer, data)
+			require.NoError(t, err)
+			require.NoError(t, <-result)
+			time.Sleep(2 * time.Second)
+		}
+	})
+}
+
+func TestClientSend_ShouldCloseConnection_WhenWriteDeadlineExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer peer.Close()
+		cli := New("blocked", conn)
+		defer cli.Close()
+		result := make(chan error, 1)
+		go func() { result <- cli.Send([]byte("blocked")) }()
+		synctest.Wait()
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		select {
+		case err := <-result:
+			require.Error(t, err)
+		case <-time.After(time.Second):
+			t.Error("write did not terminate at its deadline")
+		}
+	})
+}
+
 func TestNew_ShouldReturnClientWithExpectedID_WhenCalled(t *testing.T) {
 	conn := newStubConn()
 	client := New("client-1", conn)

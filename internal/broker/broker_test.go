@@ -13,6 +13,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBrokerPublish_ShouldReserveRetainedCapacityAtomically_WhenPublishersRunConcurrently(t *testing.T) {
+	b, err := NewWithLimits(RetainedLimits{MaxMessages: 2, MaxBytes: 100})
+	require.NoError(t, err)
+	var workers sync.WaitGroup
+	for i := range 32 {
+		workers.Go(func() {
+			err := b.Publish(&protocol.PublishPacket{Topic: fmt.Sprint(i), Payload: []byte("value"), Retain: true}, func(topic.Subscription) error { return nil })
+			if err != nil {
+				assert.ErrorIs(t, err, ErrRetainedLimit)
+			}
+		})
+	}
+	workers.Wait()
+	assert.Len(t, b.RetainedMatching("#"), 2)
+	assert.Equal(t, uint64(30), b.Snapshot().RetainedRejections)
+}
+
+func TestBrokerPublish_ShouldPreserveRetainedValueAndCapacity_WhenUpdateExceedsBudget(t *testing.T) {
+	b, err := NewWithLimits(RetainedLimits{MaxMessages: 1, MaxBytes: 8})
+	require.NoError(t, err)
+	b.Subscribe("#", 0, &stubSubscriber{id: "subscriber"})
+	deliveries := 0
+	deliver := func(topic.Subscription) error { deliveries++; return nil }
+	require.NoError(t, b.Publish(&protocol.PublishPacket{Topic: "a", Payload: []byte("123"), Retain: true}, deliver))
+	require.NoError(t, b.Publish(&protocol.PublishPacket{Topic: "a", Payload: []byte("1234567"), Retain: true}, deliver))
+	require.ErrorIs(t, b.Publish(&protocol.PublishPacket{Topic: "a", Payload: []byte("12345678"), Retain: true}, deliver), ErrRetainedLimit)
+	require.ErrorIs(t, b.Publish(&protocol.PublishPacket{Topic: "b", Payload: []byte("x"), Retain: true}, deliver), ErrRetainedLimit)
+	assert.Equal(t, 2, deliveries, "rejected retained publications must not fan out")
+	matches := b.RetainedMatching("#")
+	require.Len(t, matches, 1)
+	assert.Equal(t, []byte("1234567"), matches[0].Payload)
+	assert.Equal(t, 8, b.Snapshot().RetainedBytes)
+	require.NoError(t, b.Publish(&protocol.PublishPacket{Topic: "a", Retain: true}, deliver))
+	assert.Zero(t, b.Snapshot().RetainedBytes)
+	require.NoError(t, b.Publish(&protocol.PublishPacket{Topic: "b", Payload: []byte("x"), Retain: true}, deliver))
+	assert.Equal(t, 2, b.Snapshot().RetainedBytes)
+	assert.Equal(t, uint64(2), b.Snapshot().RetainedRejections)
+}
+
 func TestNew_ShouldReturnBrokerWithoutSubscriptionsOrRetainedMessages_WhenCalled(t *testing.T) {
 	broker := New()
 

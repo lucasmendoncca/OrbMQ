@@ -41,6 +41,33 @@ func (s *stubSubscriber) Enqueue([]byte) error {
 	return nil
 }
 
+func TestTreeUnsubscribe_ShouldReleaseEmptyBranches_WhenLastSubscriberLeaves(t *testing.T) {
+	for _, all := range []bool{false, true} {
+		tree := NewTree()
+		first := &stubSubscriber{id: "first"}
+		second := &stubSubscriber{id: "second"}
+		tree.Subscribe("devices/one/+", Subscription{ClientID: first.ID(), Subscriber: first})
+		tree.Subscribe("devices/two/+", Subscription{ClientID: second.ID(), Subscriber: second})
+		if all {
+			tree.UnsubscribeAll(first.ID())
+		} else {
+			tree.Unsubscribe("devices/one/+", first.ID())
+		}
+		// Matching alone cannot detect unreachable branches retaining allocated nodes.
+		assert.NotContains(t, tree.root.children["devices"].children, "one")
+		matches := tree.Match("devices/two/value")
+		require.Len(t, matches, 1)
+		assert.Equal(t, second.ID(), matches[0].ClientID)
+		PutSubs(matches)
+		if all {
+			tree.UnsubscribeAll(second.ID())
+		} else {
+			tree.Unsubscribe("devices/two/+", second.ID())
+		}
+		assert.Empty(t, tree.root.children)
+	}
+}
+
 func TestNewTree_ShouldReturnEmptyTree_WhenCalled(t *testing.T) {
 	tree := NewTree()
 

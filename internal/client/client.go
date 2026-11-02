@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var ErrClientQueueFull = errors.New("client queue is full")
@@ -14,15 +16,17 @@ type Client struct {
 	id   string
 	conn net.Conn
 
-	sendQ     chan queuedWrite
-	done      chan struct{}
-	writeDone chan struct{}
-	closeOnce sync.Once
+	sendQ        chan queuedWrite
+	done         chan struct{}
+	writeDone    chan struct{}
+	closeOnce    sync.Once
+	writeTimeout atomic.Int64
 }
 
 type queuedWrite struct {
-	data   []byte
-	result chan error
+	data     []byte
+	result   chan error
+	deadline time.Time
 }
 
 func New(id string, conn net.Conn) *Client {
@@ -34,6 +38,7 @@ func New(id string, conn net.Conn) *Client {
 		writeDone: make(chan struct{}),
 	}
 
+	c.writeTimeout.Store(int64(30 * time.Second))
 	go c.writeLoop()
 
 	return c
@@ -41,6 +46,15 @@ func New(id string, conn net.Conn) *Client {
 
 func (c *Client) ID() string {
 	return c.id
+}
+
+// SetWriteTimeout changes the deadline applied to subsequent connection writes.
+func (c *Client) SetWriteTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return errors.New("write timeout must be positive")
+	}
+	c.writeTimeout.Store(int64(timeout))
+	return nil
 }
 
 // Done is closed when the connection is closed, including writer failures.
@@ -58,8 +72,15 @@ func (c *Client) Enqueue(data []byte) error {
 // Send queues a complete packet and waits for its write to finish. Like Enqueue,
 // it returns ErrClientQueueFull immediately if there is no space in the queue.
 func (c *Client) Send(data []byte) error {
+	return c.SendWithDeadline(data, time.Time{})
+}
+
+// SendWithDeadline caps the write at an absolute deadline. Queueing never extends
+// that deadline; expired packets fail when the writer reaches them. A zero
+// deadline uses the configured per-write timeout.
+func (c *Client) SendWithDeadline(data []byte, deadline time.Time) error {
 	result := make(chan error, 1)
-	if err := c.enqueue(queuedWrite{data: data, result: result}); err != nil {
+	if err := c.enqueue(queuedWrite{data: data, result: result, deadline: deadline}); err != nil {
 		return err
 	}
 	select {
@@ -115,7 +136,15 @@ func (c *Client) writeLoop() {
 	for {
 		select {
 		case write := <-c.sendQ:
-			n, err := c.conn.Write(write.data)
+			deadline := time.Now().Add(time.Duration(c.writeTimeout.Load()))
+			if !write.deadline.IsZero() && write.deadline.Before(deadline) {
+				deadline = write.deadline
+			}
+			err := c.conn.SetWriteDeadline(deadline)
+			var n int
+			if err == nil {
+				n, err = c.conn.Write(write.data)
+			}
 			if err == nil && n != len(write.data) {
 				err = io.ErrShortWrite
 			}

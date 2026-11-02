@@ -6,15 +6,28 @@ import (
 )
 
 type Limits struct {
-	MaxPendingMessagesPerSession  int `yaml:"max_pending_messages_per_session"`
-	MaxPendingBytesPerSession     int `yaml:"max_pending_bytes_per_session"`
-	MaxPendingMessagesGlobal      int `yaml:"max_pending_messages_global"`
-	MaxPendingBytesGlobal         int `yaml:"max_pending_bytes_global"`
-	MaxInflightMessagesPerSession int `yaml:"max_inflight_messages_per_session"`
+	MaxSessions                   int           `yaml:"max_sessions"`
+	MaxSubscriptionsPerSession    int           `yaml:"max_subscriptions_per_session"`
+	MaxSubscriptionsGlobal        int           `yaml:"max_subscriptions_global"`
+	MaxFilterBytes                int           `yaml:"max_filter_bytes"`
+	MaxFilterLevels               int           `yaml:"max_filter_levels"`
+	OfflineTTL                    time.Duration `yaml:"offline_ttl"`
+	CleanupInterval               time.Duration `yaml:"cleanup_interval"`
+	MaxPendingMessagesPerSession  int           `yaml:"max_pending_messages_per_session"`
+	MaxPendingBytesPerSession     int           `yaml:"max_pending_bytes_per_session"`
+	MaxPendingMessagesGlobal      int           `yaml:"max_pending_messages_global"`
+	MaxPendingBytesGlobal         int           `yaml:"max_pending_bytes_global"`
+	MaxInflightMessagesPerSession int           `yaml:"max_inflight_messages_per_session"`
 }
 
 func DefaultLimits() Limits {
 	return Limits{
+		MaxSessions:                   10000,
+		MaxSubscriptionsPerSession:    1000,
+		MaxSubscriptionsGlobal:        100000,
+		MaxFilterBytes:                4096,
+		MaxFilterLevels:               64,
+		CleanupInterval:               time.Minute,
 		MaxPendingMessagesPerSession:  1000,
 		MaxPendingBytesPerSession:     16 << 20,
 		MaxPendingMessagesGlobal:      100000,
@@ -24,6 +37,12 @@ func DefaultLimits() Limits {
 }
 
 func (l Limits) Validate() error {
+	if l.MaxSessions <= 0 || l.MaxSubscriptionsPerSession <= 0 || l.MaxSubscriptionsGlobal <= 0 || l.MaxFilterBytes <= 0 || l.MaxFilterLevels <= 0 {
+		return errors.New("resource limits must be positive")
+	}
+	if l.MaxSubscriptionsPerSession > l.MaxSubscriptionsGlobal || l.MaxFilterBytes > 65535 || l.OfflineTTL < 0 || l.CleanupInterval <= 0 {
+		return errors.New("invalid session resource limits")
+	}
 	if l.MaxPendingMessagesPerSession <= 0 || l.MaxPendingBytesPerSession <= 0 || l.MaxPendingMessagesGlobal <= 0 || l.MaxPendingBytesGlobal <= 0 || l.MaxInflightMessagesPerSession <= 0 {
 		return errors.New("session limits must be positive")
 	}
@@ -44,12 +63,18 @@ const (
 )
 
 type Snapshot struct {
-	PendingMessages   int
-	PendingBytes      int
-	InflightMessages  int
-	SessionLimitDrops uint64
-	GlobalLimitDrops  uint64
-	OldestPendingAge  time.Duration
+	SessionCount           int
+	SubscriptionCount      int
+	SessionRejections      uint64
+	SubscriptionRejections uint64
+	FilterRejections       uint64
+	ExpiredSessions        uint64
+	PendingMessages        int
+	PendingBytes           int
+	InflightMessages       int
+	SessionLimitDrops      uint64
+	GlobalLimitDrops       uint64
+	OldestPendingAge       time.Duration
 }
 type entry struct {
 	data           []byte
@@ -196,6 +221,7 @@ func (s *State) notifyLocked() {
 }
 func (s *State) snapshotLocked(now time.Time) Snapshot {
 	result := s.stats
+	result.SubscriptionCount = len(s.subscriptions)
 	result.InflightMessages = len(s.inflight)
 	if len(s.entries) > 0 {
 		result.OldestPendingAge = now.Sub(s.entries[0].accepted)
@@ -211,6 +237,7 @@ func (s *Store) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := s.totals
+	result.SessionCount = len(s.data)
 	now := time.Now()
 	for _, state := range s.data {
 		age := state.snapshotLocked(now).OldestPendingAge
