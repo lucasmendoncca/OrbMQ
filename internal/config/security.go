@@ -49,7 +49,7 @@ func (s Security) Prepare() (*auth.Local, *tls.Config, error) {
 	if s.Mode != "secure" || s.TLS == nil || s.CredentialsFile == "" {
 		return nil, nil, errors.New("invalid security configuration")
 	}
-	policy, err := auth.Load(s.CredentialsFile)
+	policy, err := loadCredentials(s.CredentialsFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load credentials: %w", err)
 	}
@@ -58,4 +58,30 @@ func (s Security) Prepare() (*auth.Local, *tls.Config, error) {
 		return nil, nil, errors.New("load tls certificate and key failed")
 	}
 	return policy, &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{certificate}}, nil
+}
+
+func loadCredentials(path string) (*auth.Local, error) {
+	var document struct {
+		Users []struct {
+			Username     string   `yaml:"username"`
+			PasswordHash string   `yaml:"password_hash"`
+			ClientIDs    []string `yaml:"client_ids"`
+			Publish      []string `yaml:"publish"`
+			Subscribe    []string `yaml:"subscribe"`
+		} `yaml:"users"`
+	}
+	if err := loadYAML(path, &document); err != nil {
+		return nil, err
+	}
+	users := make([]auth.User, len(document.Users))
+	for i, entry := range document.Users {
+		users[i] = auth.User{
+			Username:     entry.Username,
+			PasswordHash: entry.PasswordHash,
+			ClientIDs:    entry.ClientIDs,
+			Publish:      entry.Publish,
+			Subscribe:    entry.Subscribe,
+		}
+	}
+	return auth.New(users)
 }

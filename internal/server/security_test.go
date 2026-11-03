@@ -8,13 +8,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
-	"os"
-	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -163,9 +160,10 @@ func securityFixture(t *testing.T) (*auth.Local, *tls.Config, *tls.Config) {
 	t.Helper()
 	hash, err := auth.HashPassword("password")
 	require.NoError(t, err)
-	path := filepath.Join(t.TempDir(), "users.yaml")
-	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf("users:\n  - username: sensor\n    password_hash: %q\n    client_ids: [device, publisher]\n    publish: [devices/42/#]\n    subscribe: [devices/42/commands/#]\n  - username: other\n    password_hash: %q\n    client_ids: [other]\n    publish: [private/#]\n    subscribe: [private/#]\n", hash, hash)), 0600))
-	policy, err := auth.Load(path)
+	policy, err := auth.New([]auth.User{
+		{Username: "sensor", PasswordHash: hash, ClientIDs: []string{"device", "publisher"}, Publish: []string{"devices/42/#"}, Subscribe: []string{"devices/42/commands/#"}},
+		{Username: "other", PasswordHash: hash, ClientIDs: []string{"other"}, Publish: []string{"private/#"}, Subscribe: []string{"private/#"}},
+	})
 	require.NoError(t, err)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)

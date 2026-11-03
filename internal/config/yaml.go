@@ -1,5 +1,4 @@
-// Package configfile loads bounded, strict YAML without including input values in errors.
-package configfile
+package config
 
 import (
 	"bytes"
@@ -10,7 +9,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func Load(path string, target any) error {
+// loadYAML loads bounded, strict YAML without including input values in errors.
+func loadYAML(path string, target any) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err

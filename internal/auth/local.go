@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/lucasmendoncca/OrbMQ/internal/configfile"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/topic"
 )
@@ -16,13 +16,20 @@ type Identity string
 
 var ErrBusy = errors.New("authentication capacity reached")
 
+// User supplies the identity and permissions used to construct a local policy.
+type User struct {
+	Username     string
+	PasswordHash string
+	ClientIDs    []string
+	Publish      []string
+	Subscribe    []string
+}
+
 type user struct {
-	Username     string   `yaml:"username"`
-	PasswordHash string   `yaml:"password_hash"`
-	ClientIDs    []string `yaml:"client_ids"`
-	Publish      []string `yaml:"publish"`
-	Subscribe    []string `yaml:"subscribe"`
-	hash         passwordHash
+	ClientIDs []string
+	Publish   []string
+	Subscribe []string
+	hash      passwordHash
 }
 
 // Local is an immutable identity and permission snapshot. Only authentication
@@ -33,19 +40,14 @@ type Local struct {
 	dummy passwordHash
 }
 
-func Load(path string) (*Local, error) {
-	var document struct {
-		Users []user `yaml:"users"`
-	}
-	if err := configfile.Load(path, &document); err != nil {
-		return nil, err
-	}
-	if len(document.Users) == 0 {
+// New validates users and owns a private copy of their permissions.
+func New(users []User) (*Local, error) {
+	if len(users) == 0 {
 		return nil, errors.New("credentials require at least one user")
 	}
 	local := &Local{users: make(map[Identity]user), slots: make(chan struct{}, runtime.GOMAXPROCS(0)), dummy: passwordHash{salt: make([]byte, 16), key: make([]byte, 32)}}
 	ids := make(map[string]bool)
-	for _, entry := range document.Users {
+	for _, entry := range users {
 		identity := Identity(entry.Username)
 		if !validName(entry.Username) || len(entry.ClientIDs) == 0 {
 			return nil, errors.New("invalid identity configuration")
@@ -57,8 +59,6 @@ func Load(path string) (*Local, error) {
 		if err != nil {
 			return nil, err
 		}
-		entry.hash = hash
-		entry.PasswordHash = ""
 		for _, id := range entry.ClientIDs {
 			if !validName(id) || strings.ContainsAny(id, "+#") || ids[id] {
 				return nil, errors.New("invalid or duplicate client id")
@@ -72,7 +72,12 @@ func Load(path string) (*Local, error) {
 				}
 			}
 		}
-		local.users[identity] = entry
+		local.users[identity] = user{
+			ClientIDs: slices.Clone(entry.ClientIDs),
+			Publish:   slices.Clone(entry.Publish),
+			Subscribe: slices.Clone(entry.Subscribe),
+			hash:      hash,
+		}
 	}
 	return local, nil
 }

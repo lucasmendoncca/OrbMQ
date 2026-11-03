@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
-	"github.com/lucasmendoncca/OrbMQ/internal/configfile"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/server"
 	"github.com/lucasmendoncca/OrbMQ/internal/session"
@@ -50,7 +49,7 @@ func Defaults() Config {
 // rather than silently replacing or bypassing defaults.
 func Load(path string) (Config, error) {
 	cfg := Defaults()
-	if err := configfile.Load(path, &cfg); err != nil {
+	if err := loadYAML(path, &cfg); err != nil {
 		return Config{}, fmt.Errorf("load configuration: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
