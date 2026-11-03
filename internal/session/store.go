@@ -10,6 +10,7 @@ import (
 )
 
 var (
+	ErrSessionOwner      = errors.New("session belongs to another identity")
 	ErrSessionLimit      = errors.New("session limit reached")
 	ErrSubscriptionLimit = errors.New("subscription limit reached")
 	ErrFilterLimit       = errors.New("filter limit reached")
@@ -32,6 +33,7 @@ type Subscription struct {
 type State struct {
 	store          *Store
 	id             string
+	owner          string
 	deleted        bool
 	subscriptions  map[string]byte
 	entries        []*entry
@@ -69,16 +71,25 @@ func (s *Store) Get(id string) (*State, bool) {
 	return state, ok
 }
 func (s *Store) GetOrCreate(id string) (*State, bool, error) {
+	return s.GetOrCreateOwned(id, "")
+}
+
+// GetOrCreateOwned binds new sessions to an immutable owner and refuses access
+// by another identity without changing subscriptions, queues or capacity.
+func (s *Store) GetOrCreateOwned(id, owner string) (*State, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state, ok := s.data[id]; ok {
+		if state.owner != owner {
+			return nil, false, ErrSessionOwner
+		}
 		return state, true, nil
 	}
 	if len(s.data) >= s.limits.MaxSessions {
 		s.totals.SessionRejections++
 		return nil, false, ErrSessionLimit
 	}
-	state := &State{store: s, id: id, subscriptions: make(map[string]byte), inflight: make(map[uint16]*entry), changed: make(chan struct{}, 1), offlineSince: time.Now()}
+	state := &State{store: s, id: id, owner: owner, subscriptions: make(map[string]byte), inflight: make(map[uint16]*entry), changed: make(chan struct{}, 1), offlineSince: time.Now()}
 	s.data[id] = state
 	return state, false, nil
 }
@@ -107,6 +118,8 @@ func (s *Store) deleteLocked(id string) {
 	delete(s.data, id)
 }
 func (s *State) ID() string { return s.id }
+
+func (s *State) Owner() string { return s.owner }
 
 func (s *State) SetSubscription(filter string, qos byte) error {
 	s.store.mu.Lock()

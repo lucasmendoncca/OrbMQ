@@ -34,6 +34,7 @@ func Run(ctx context.Context, sources Sources, summaryInterval, saturationInterv
 			stats := store.Snapshot()
 			logger.Printf("sessions pending_messages=%d pending_bytes=%d inflight_messages=%d oldest_pending_age=%s session_limit_drops=%d global_limit_drops=%d", stats.PendingMessages, stats.PendingBytes, stats.InflightMessages, stats.OldestPendingAge, stats.SessionLimitDrops, stats.GlobalLimitDrops)
 			connections, retained := sources.Server.Snapshot(), sources.Broker.Snapshot()
+			logger.Printf("security authentication_rejections=%d authorization_rejections=%d", connections.AuthenticationRejections, connections.AuthorizationRejections)
 			logger.Printf("resources connections=%d handshakes=%d sessions=%d subscriptions=%d retained_messages=%d retained_bytes=%d expired_sessions=%d", connections.Connections, connections.Handshakes, stats.SessionCount, stats.SubscriptionCount, retained.RetainedMessages, retained.RetainedBytes, stats.ExpiredSessions)
 		case <-saturation.C:
 			stats := store.Snapshot()
@@ -47,6 +48,7 @@ func Run(ctx context.Context, sources Sources, summaryInterval, saturationInterv
 			}
 			connections, retained := sources.Server.Snapshot(), sources.Broker.Snapshot()
 			for reason, total := range map[string]uint64{
+				"authentication": connections.AuthenticationRejections, "authorization": connections.AuthorizationRejections,
 				"connections": connections.ConnectionRejections, "handshakes": connections.HandshakeRejections,
 				"sessions": stats.SessionRejections, "subscriptions": stats.SubscriptionRejections,
 				"filters": stats.FilterRejections, "retained": retained.RetainedRejections,

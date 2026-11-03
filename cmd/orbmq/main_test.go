@@ -11,7 +11,7 @@ import (
 
 func TestRun_ShouldLoadCustomConfigurationAndStop_WhenContextIsCancelled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("server:\n  address: '127.0.0.1:0'\n"), 0600))
+	require.NoError(t, os.WriteFile(path, []byte("security: {mode: development}\nserver:\n  address: '127.0.0.1:0'\n"), 0600))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.NoError(t, run(ctx, path))

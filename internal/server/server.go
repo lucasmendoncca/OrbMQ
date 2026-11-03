@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lucasmendoncca/OrbMQ/internal/auth"
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
 	"github.com/lucasmendoncca/OrbMQ/internal/client"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
@@ -24,6 +26,8 @@ var errDisconnect = errors.New("client disconnected")
 type Option func(*Server)
 
 type Server struct {
+	auth             *auth.Local
+	tlsConfig        *tls.Config
 	addr             string
 	broker           *broker.Broker
 	sessions         *session.Store
@@ -80,10 +84,12 @@ func (l ConnectionLimits) Validate() error {
 }
 
 type Snapshot struct {
-	Connections          int
-	Handshakes           int
-	ConnectionRejections uint64
-	HandshakeRejections  uint64
+	AuthenticationRejections uint64
+	AuthorizationRejections  uint64
+	Connections              int
+	Handshakes               int
+	ConnectionRejections     uint64
+	HandshakeRejections      uint64
 }
 
 func (s *Server) Snapshot() Snapshot {
@@ -165,6 +171,9 @@ func WithMaxPacketSize(size int) Option {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	if (s.auth == nil) != (s.tlsConfig == nil) {
+		return errors.New("security requires both authentication and tls")
+	}
 	if err := s.connectionLimits.Validate(); err != nil {
 		return err
 	}
@@ -180,6 +189,9 @@ func (s *Server) Start(ctx context.Context) error {
 	ln, err := s.listenFn("tcp", s.addr)
 	if err != nil {
 		return err
+	}
+	if s.tlsConfig != nil {
+		ln = tls.NewListener(ln, s.tlsConfig)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	expiryDone := s.startSessionExpiry(runCtx)
@@ -285,9 +297,17 @@ func (g *connectionGroup) wait() {
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	handshakeDeadline := time.Now().Add(s.handshakeTimeout)
+	handshakeCtx, cancelHandshake := context.WithDeadline(ctx, handshakeDeadline)
+	defer cancelHandshake()
 	if err := conn.SetDeadline(handshakeDeadline); err != nil {
 		_ = conn.Close()
 		return
+	}
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+			_ = conn.Close()
+			return
+		}
 	}
 	reader := bufio.NewReader(conn)
 	connect, cli, err := s.handshake(conn, reader)
@@ -313,8 +333,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 	}()
 
-	owner, sessionPresent, err := s.acquireConnection(ctx, connect, cli)
+	identity, code := s.authenticateConnect(handshakeCtx, connect)
+	if code != protocol.ConnAckAccepted {
+		s.rejectConnection(cli, code, handshakeDeadline)
+		return
+	}
+	// Do not retain CONNECT credentials for the connection's lifetime.
+	connect.Username, connect.Password = nil, nil
+	owner, sessionPresent, err := s.acquireConnection(handshakeCtx, connect, cli, identity)
 	if err != nil {
+		if errors.Is(err, session.ErrSessionOwner) {
+			s.rejectConnection(cli, protocol.ConnAckNotAuthorized, handshakeDeadline)
+		}
 		return
 	}
 	sess := owner.session
@@ -337,6 +367,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	s.connections.completeHandshake(conn)
+	cancelHandshake()
 
 	s.clientsMu.Lock()
 	owner.ready = true
@@ -378,7 +409,7 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*protocol.Conne
 }
 
 // openSession restores a persistent session or creates a clean one.
-func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, bool, error) {
+func (s *Server) openSession(connect *protocol.ConnectPacket, identity auth.Identity) (*session.State, bool, error) {
 	if s.sessions.ExpireSession(connect.ClientID, time.Now()) {
 		s.broker.UnsubscribeAll(connect.ClientID)
 	}
@@ -387,21 +418,25 @@ func (s *Server) openSession(connect *protocol.ConnectPacket) (*session.State, b
 		s.sessions.Delete(connect.ClientID)
 	}
 
-	return s.sessions.GetOrCreate(connect.ClientID)
+	return s.sessions.GetOrCreateOwned(connect.ClientID, string(identity))
 }
 
 // acquireConnection waits for the previous owner's handlers, writer and cleanup
 // before opening a session. No network I/O or waiting holds clientsMu.
-func (s *Server) acquireConnection(ctx context.Context, connect *protocol.ConnectPacket, cli *client.Client) (*activeConnection, bool, error) {
+func (s *Server) acquireConnection(ctx context.Context, connect *protocol.ConnectPacket, cli *client.Client, identity auth.Identity) (*activeConnection, bool, error) {
 	for {
 		s.clientsMu.Lock()
 		if err := ctx.Err(); err != nil {
 			s.clientsMu.Unlock()
 			return nil, false, err
 		}
+		if state, found := s.sessions.Get(cli.ID()); found && state.Owner() != string(identity) {
+			s.clientsMu.Unlock()
+			return nil, false, session.ErrSessionOwner
+		}
 		previous := s.clients[cli.ID()]
 		if previous == nil {
-			state, present, err := s.openSession(connect)
+			state, present, err := s.openSession(connect, identity)
 			if err != nil {
 				s.clientsMu.Unlock()
 				return nil, false, err
@@ -519,6 +554,9 @@ func (s *Server) handlePacket(cli *client.Client, sess *session.State, pkt proto
 	case *protocol.UnsubscribePacket:
 		return s.handleUnsubscribe(cli, sess, p)
 	case *protocol.PublishPacket:
+		if !s.canPublish(auth.Identity(sess.Owner()), p.Topic) {
+			return errors.New("publication not authorized")
+		}
 		return s.handlePublish(cli, p)
 	case *protocol.DisconnectPacket:
 		log.Printf("client %s sent DISCONNECT", cli.ID())
@@ -564,6 +602,10 @@ func (s *Server) handleSubscribe(cli *client.Client, sess *session.State, p *pro
 	defer sess.ResumeDelivery()
 	codes := make([]byte, len(p.Subscriptions))
 	for i, sub := range p.Subscriptions {
+		if !s.canSubscribe(auth.Identity(sess.Owner()), sub.Topic) {
+			codes[i] = 0x80
+			continue
+		}
 		qos := sub.QoS
 		if qos > 1 {
 			qos = 1

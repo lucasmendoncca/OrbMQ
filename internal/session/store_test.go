@@ -12,6 +12,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGetOrCreateOwned_ShouldPreserveSession_WhenAnotherIdentityRequestsItsID(t *testing.T) {
+	store := New()
+	state, present, err := store.GetOrCreateOwned("device", "alice")
+	require.NoError(t, err)
+	assert.False(t, present)
+	require.NoError(t, state.SetSubscription("private/#", 1))
+	_, _, err = store.GetOrCreateOwned("device", "bob")
+	require.ErrorIs(t, err, ErrSessionOwner)
+	restored, present, err := store.GetOrCreateOwned("device", "alice")
+	require.NoError(t, err)
+	assert.True(t, present)
+	assert.Same(t, state, restored)
+	assert.Equal(t, "alice", restored.Owner())
+	assert.Len(t, restored.SnapshotSubscriptions(), 1)
+}
+
 func TestStoreGetOrCreate_ShouldEnforceGlobalBudgets_WhenAdmissionsRunConcurrently(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxSessions = 2

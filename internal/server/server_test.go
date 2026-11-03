@@ -1743,6 +1743,8 @@ func (c *scriptConn) SetWriteDeadline(time.Time) error { return nil }
 
 type connectOptions struct {
 	clientID     string
+	username     *string
+	password     *string
 	cleanSession bool
 	keepAlive    uint16
 	will         *protocol.WillMessage
@@ -1987,6 +1989,14 @@ func encodeConnectPacket(t *testing.T, opts connectOptions) []byte {
 		writeBinary(t, &payload, opts.will.Payload)
 	}
 
+	if opts.username != nil {
+		flags |= 0x80
+		writeUTF8(t, &payload, *opts.username)
+	}
+	if opts.password != nil {
+		flags |= 0x40
+		writeBinary(t, &payload, []byte(*opts.password))
+	}
 	var variable bytes.Buffer
 	writeUTF8(t, &variable, "MQTT")
 	require.NoError(t, variable.WriteByte(0x04))

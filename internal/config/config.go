@@ -1,23 +1,22 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/lucasmendoncca/OrbMQ/internal/broker"
+	"github.com/lucasmendoncca/OrbMQ/internal/configfile"
 	"github.com/lucasmendoncca/OrbMQ/internal/protocol"
 	"github.com/lucasmendoncca/OrbMQ/internal/server"
 	"github.com/lucasmendoncca/OrbMQ/internal/session"
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
+	Security      Security              `yaml:"security"`
 	Server        Server                `yaml:"server"`
 	Sessions      session.Limits        `yaml:"sessions"`
 	Retained      broker.RetainedLimits `yaml:"retained"`
@@ -41,7 +40,7 @@ type Observability struct {
 func Defaults() Config {
 	limits := server.DefaultConnectionLimits()
 	return Config{
-		Server:   Server{Address: ":1883", HandshakeTimeout: 10 * time.Second, MaxPacketSizeBytes: 1 << 20, MaxConnections: limits.MaxConnections, MaxHandshakes: limits.MaxHandshakes, WriteTimeout: 30 * time.Second},
+		Server:   Server{Address: "127.0.0.1:1883", HandshakeTimeout: 10 * time.Second, MaxPacketSizeBytes: 1 << 20, MaxConnections: limits.MaxConnections, MaxHandshakes: limits.MaxHandshakes, WriteTimeout: 30 * time.Second},
 		Sessions: session.DefaultLimits(), Retained: broker.DefaultRetainedLimits(),
 		Observability: Observability{30 * time.Second, 10 * time.Second},
 	}
@@ -50,54 +49,25 @@ func Defaults() Config {
 // Load requires one YAML mapping. Unknown fields, nulls and aliases are rejected
 // rather than silently replacing or bypassing defaults.
 func Load(path string) (Config, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("open configuration: %w", err)
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 65537))
-	if err != nil {
-		return Config{}, fmt.Errorf("read configuration: %w", err)
-	}
-	if len(data) > 65536 {
-		return Config{}, errors.New("configuration exceeds size limit")
-	}
-	var document yaml.Node
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return Config{}, fmt.Errorf("parse configuration: %w", err)
-	}
-	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
-		return Config{}, errors.New("configuration must be a mapping")
-	}
-	if err := validateNodes(&document); err != nil {
-		return Config{}, err
-	}
 	cfg := Defaults()
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
-		return Config{}, fmt.Errorf("decode configuration: %w", err)
-	}
-	var extra yaml.Node
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return Config{}, errors.New("configuration must contain one document")
+	if err := configfile.Load(path, &cfg); err != nil {
+		return Config{}, fmt.Errorf("load configuration: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
-	return cfg, nil
-}
-
-func validateNodes(node *yaml.Node) error {
-	if node.Tag == "!!null" || node.Kind == yaml.AliasNode {
-		return errors.New("configuration cannot contain nulls or aliases")
-	}
-	for _, child := range node.Content {
-		if err := validateNodes(child); err != nil {
-			return err
+	resolve := func(value string) string {
+		if value == "" || filepath.IsAbs(value) {
+			return value
 		}
+		return filepath.Join(filepath.Dir(path), value)
 	}
-	return nil
+	cfg.Security.CredentialsFile = resolve(cfg.Security.CredentialsFile)
+	if cfg.Security.TLS != nil {
+		cfg.Security.TLS.CertFile = resolve(cfg.Security.TLS.CertFile)
+		cfg.Security.TLS.KeyFile = resolve(cfg.Security.TLS.KeyFile)
+	}
+	return cfg, nil
 }
 
 func (c Config) Validate() error {
@@ -130,5 +100,5 @@ func (c Config) Validate() error {
 	if c.Observability.SummaryInterval <= 0 || c.Observability.SaturationLogInterval <= 0 {
 		return errors.New("observation intervals must be positive")
 	}
-	return nil
+	return c.Security.validate(c.Server.Address)
 }

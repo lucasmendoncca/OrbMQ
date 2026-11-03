@@ -1,5 +1,8 @@
+security:
+  mode: development
+
 server:
-  address: ":1883"
+  address: "127.0.0.1:1883"
   handshake_timeout: "10s"
   max_packet_size_bytes: 1048576
   max_connections: 10000
