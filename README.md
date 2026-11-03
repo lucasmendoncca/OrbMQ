@@ -14,6 +14,7 @@ OrbMQ currently provides a functional MQTT 3.1.1 publish/subscribe flow with:
 - in-memory sessions that restore subscriptions and pending QoS 1 messages when reconnecting with the same Client ID and `CleanSession=false`
 - Last Will publication on unexpected disconnects
 - Keep Alive timeout enforcement
+- TLS with local username/password authentication and topic permissions
 - concurrent fan-out
 - buffered client writes with backpressure handling
 - a modular internal architecture around broker, protocol, topic, server, client, and session responsibilities
@@ -39,7 +40,6 @@ Not implemented yet as complete broker capabilities:
 - MQTT 5 support
 - durable session storage across process restarts
 - QoS 2 flows
-- TLS, authentication, and authorization
 - clustering
 - management API and UI
 
@@ -146,7 +146,9 @@ These patterns should continue to guide future work, especially when extending t
 go run ./cmd/orbmq/main.go
 ```
 
-The executable loads the required `config.yaml` from its working directory and listens on `:1883` (all interfaces) by default. Use `go run ./cmd/orbmq/main.go -config path/to/config.yaml` to select another file. Configuration is loaded once before listening; there is no reload or environment override. Connections use plain TCP without authentication or authorization; CONNECT credentials are parsed but not authenticated.
+The executable loads the required `config.yaml` from its working directory. The checked-in configuration explicitly selects development mode and listens on `127.0.0.1:1883`, using plain TCP without authentication. Use `go run ./cmd/orbmq/main.go -config path/to/config.yaml` to select another file. Configuration is loaded once before listening; there is no reload or environment override.
+
+Every configuration must explicitly select `security.mode: development` or `security.mode: secure`. Development requires a literal loopback address; secure mode requires TLS, a server certificate/key and local credentials. Older configurations must be migrated. See [Security configuration](SECURITY.md) for setup, topic permissions, password generation and rotation.
 
 ### Configuration and session capacity
 
@@ -289,7 +291,7 @@ Planned evolution areas include:
 - full MQTT 5 protocol support
 - durable session storage
 - QoS 2 support
-- TLS, authentication, and authorization
+- mutual TLS and external authentication providers
 - metrics and observability
 - Docker image and containerized deployment
 - cluster coordination and multi-node routing
