@@ -1,5 +1,33 @@
 package topic
 
+import "strings"
+
+// CoversFilter reports whether every valid topic matched by requested is also
+// matched by allowed. Both inputs must be valid MQTT topic filters.
+func CoversFilter(allowed, requested string) bool {
+	if strings.HasPrefix(requested, "$") && (allowed[0] == '+' || allowed[0] == '#') {
+		return false
+	}
+	// A root # and +/# cover the same nonempty, non-system topic names.
+	if requested == "#" {
+		requested = "+/#"
+	}
+	// /# can omit its suffix only to produce the invalid empty topic name.
+	if requested == "/#" {
+		requested = "/+/#"
+	}
+	a, r := splitFilter(allowed), splitFilter(requested)
+	for i, level := range a {
+		if level == "#" {
+			return true
+		}
+		if i >= len(r) || r[i] == "#" || (level != "+" && level != r[i]) {
+			return false
+		}
+	}
+	return len(a) == len(r)
+}
+
 // MatchFilter takes a filter string and a topic string and returns true if the
 // topic matches the filter, and false otherwise. The filter string can contain
 // single-level or multi-level wildcards. For example, the filter string "foo/bar"

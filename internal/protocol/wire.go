@@ -69,7 +69,8 @@ func validateTopicName(value string) error {
 	return nil
 }
 
-func validateTopicFilter(value string) error {
+// ValidateTopicFilter applies the same MQTT rules to ACLs and wire packets.
+func ValidateTopicFilter(value string) error {
 	if err := validateUTF8String(value); err != nil {
 		return err
 	}

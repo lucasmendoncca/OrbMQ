@@ -65,7 +65,10 @@ type ConnAckPacket struct {
 type ConnAckReturnCode byte
 
 const (
-	ConnAckAccepted ConnAckReturnCode = 0x00
+	ConnAckAccepted          ConnAckReturnCode = 0x00
+	ConnAckServerUnavailable ConnAckReturnCode = 0x03
+	ConnAckBadCredentials    ConnAckReturnCode = 0x04
+	ConnAckNotAuthorized     ConnAckReturnCode = 0x05
 )
 
 func (c *ConnAckPacket) Type() PacketType {

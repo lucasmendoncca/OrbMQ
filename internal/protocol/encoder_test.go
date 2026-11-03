@@ -11,6 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestEncode_ShouldWriteRejectedConnAck_WhenAuthenticationOrAuthorizationFails(t *testing.T) {
+	for _, code := range []ConnAckReturnCode{ConnAckServerUnavailable, ConnAckBadCredentials, ConnAckNotAuthorized} {
+		var output bytes.Buffer
+		require.NoError(t, Encode(&output, &ConnAckPacket{ReturnCode: code}))
+		assert.Equal(t, []byte{0x20, 2, 0, byte(code)}, output.Bytes())
+	}
+}
+
 func TestEncodePublish_ShouldRejectInvalidTopics_WhenPacketIsEncoded(t *testing.T) {
 	for _, topic := range []string{"", "a/+", "a/#", "a\x00", "\xff", strings.Repeat("a", 65536)} {
 		var output bytes.Buffer

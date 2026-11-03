@@ -256,7 +256,7 @@ func decodeSubscribe(r io.Reader, remainingLength int) (*SubscribePacket, error)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateTopicFilter(topic); err != nil {
+		if err := ValidateTopicFilter(topic); err != nil {
 			return nil, err
 		}
 
@@ -362,7 +362,7 @@ func decodeUnsubscribe(r io.Reader, remainingLength int) (*UnsubscribePacket, er
 		if err != nil {
 			return nil, err
 		}
-		if err := validateTopicFilter(topic); err != nil {
+		if err := ValidateTopicFilter(topic); err != nil {
 			return nil, err
 		}
 		topics = append(topics, topic)

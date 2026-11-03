@@ -7,6 +7,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCoversFilter_ShouldRequireFullCoverage_WhenFiltersContainWildcards(t *testing.T) {
+	for _, tc := range []struct {
+		allowed, requested string
+		covered            bool
+	}{
+		{"devices/42/#", "devices/42/commands/+", true},
+		{"devices/42/#", "devices/+/#", false},
+		{"a/#", "a", true}, {"a/+", "a/#", false},
+		{"a/+/#", "a/+", true}, {"a/+/+", "a/+/#", false},
+		{"#", "$SYS/#", false}, {"+/#", "$SYS/status", false},
+		{"$SYS/#", "$SYS/+", true}, {"#", "+/#", true},
+		{"a/+", "a/", true}, {"a/", "a/+", false},
+		{"a/#", "a//+", true}, {"a/+/#", "a", false},
+		{"a/+", "a/+", true}, {"a/b", "a/b/c", false},
+		{"+/#", "#", true}, {"+/+", "#", false},
+		{"+/+/#", "/#", true}, {"/+/#", "/#", true},
+		{"+/+", "/#", false}, {"+/+/#", "//#", true},
+	} {
+		t.Run(tc.allowed+" covers "+tc.requested, func(t *testing.T) {
+			assert.Equal(t, tc.covered, CoversFilter(tc.allowed, tc.requested))
+		})
+	}
+}
+
 func TestMatchFilter_ShouldRespectTopicLevels_WhenWildcardsAreUsed(t *testing.T) {
 	for _, tc := range []struct {
 		filter, topic string
